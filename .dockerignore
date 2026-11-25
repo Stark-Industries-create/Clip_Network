@@ -1,0 +1,15 @@
+.git
+.agents
+.codex
+.aws
+**/node_modules
+**/dist
+**/.next
+**/*.tsbuildinfo
+**/data
+**/renders
+.env
+.env.*
+!.env.example
+
+backups/

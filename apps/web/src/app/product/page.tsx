@@ -61,7 +61,7 @@ const PIPELINE_STAGES = [
     name: 'Publishing Results',
     tech: 'PublishPost (Idempotent Delivery)',
     detail:
-      'Every post carries a unique idempotencyKey to prevent duplicate uploads on retry and transparently records SANDBOX_SIMULATED vs LIVE_OAUTH execution mode.',
+      'Every post carries a unique key, so retries never upload the same clip twice, and each post shows exactly where and when it went live.',
   },
 ];
 

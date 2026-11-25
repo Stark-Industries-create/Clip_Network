@@ -72,6 +72,7 @@ export default function AdminUsersPage() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <Input
             placeholder="Search users by name or email..."
+            aria-label="Search users"
             value={q}
             onChange={(e) => setQ(e.target.value)}
             className="max-w-sm h-9 text-xs"

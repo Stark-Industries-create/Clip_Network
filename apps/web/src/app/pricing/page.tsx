@@ -170,11 +170,8 @@ export default function PricingPage() {
           <div className="space-y-1">
             <div className="font-medium text-foreground">Billing Transparency</div>
             <p>
-              Monthly billing only. When live Stripe credentials are not configured on a self-hosted
-              or development instance, checkout operates transparently in{' '}
-              <code className="font-mono text-foreground">SANDBOX_WEBHOOK</code> mode using real
-              HMAC-SHA256 webhook verification. Paid plans are never activated from unverified
-              frontend state.
+              Monthly billing, paid securely through Stripe. Your plan changes only after Stripe
+              confirms the payment, and you can cancel any time from Billing.
             </p>
           </div>
         </div>

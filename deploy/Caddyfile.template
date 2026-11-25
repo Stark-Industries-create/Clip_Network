@@ -1,0 +1,27 @@
+# Clip Network TLS edge. setup-vps.sh fills in the domain and installs this as /etc/caddy/Caddyfile.
+# Caddy obtains and renews the HTTPS certificate automatically.
+{
+	email __ACME_EMAIL__
+}
+
+__APP_DOMAIN__ {
+	encode zstd gzip
+
+	# Signed clip and source URLs (path-style S3) go to MinIO. The Host header is kept, so the
+	# signatures the API made for this domain stay valid.
+	handle /__S3_BUCKET__/* {
+		reverse_proxy 127.0.0.1:9000
+	}
+
+	# Everything else: the web app, with the API under /api (nginx routes between them).
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	log {
+		output file /var/log/caddy/clip-network.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+	}
+}

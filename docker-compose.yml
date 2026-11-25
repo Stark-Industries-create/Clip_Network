@@ -3,21 +3,41 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.api
+    command: ["sh", "-ec", "cd /app/apps/api && node node_modules/prisma/build/index.js db push --skip-generate && exec node dist/index.js"]
     ports:
-      - "4100:4100"
+      - "127.0.0.1:${LOCAL_API_PORT:-4100}:4100"
     environment:
-      NODE_ENV: production
+      NODE_ENV: development
       PORT: 4100
       DATABASE_URL: file:/app/apps/api/data/clip-network.db
       ENCRYPTION_MASTER_KEY: ${ENCRYPTION_MASTER_KEY:-replace-with-32-byte-secret-in-production}
       BILLING_WEBHOOK_SECRET: ${BILLING_WEBHOOK_SECRET:-replace-with-hmac-webhook-secret}
-      SUPER_ADMIN_EMAIL: ${SUPER_ADMIN_EMAIL:-admin@clipnetwork.io}
-      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-http://127.0.0.1:${LOCAL_WEB_PORT:-3100}}
+      INSTAGRAM_CLIENT_ID: ${INSTAGRAM_CLIENT_ID:-}
+      INSTAGRAM_CLIENT_SECRET: ${INSTAGRAM_CLIENT_SECRET:-}
+      FACEBOOK_CLIENT_ID: ${FACEBOOK_CLIENT_ID:-}
+      FACEBOOK_CLIENT_SECRET: ${FACEBOOK_CLIENT_SECRET:-}
+      YOUTUBE_CLIENT_ID: ${YOUTUBE_CLIENT_ID:-}
+      YOUTUBE_CLIENT_SECRET: ${YOUTUBE_CLIENT_SECRET:-}
+      TIKTOK_CLIENT_ID: ${TIKTOK_CLIENT_ID:-}
+      TIKTOK_CLIENT_SECRET: ${TIKTOK_CLIENT_SECRET:-}
+      YOUTUBE_MADE_FOR_KIDS: ${YOUTUBE_MADE_FOR_KIDS:-}
+      META_GRAPH_VERSION: ${META_GRAPH_VERSION:-}
       POSTIZ_API_KEY: ${POSTIZ_API_KEY:-}
+      POSTIZ_API_BASE_URL: ${POSTIZ_API_BASE_URL:-https://api.postiz.com/public/v1}
+      POSTIZ_FRONTEND_URL: ${POSTIZ_FRONTEND_URL:-https://platform.postiz.com}
+      POSTIZ_INSTAGRAM_WORKSPACE_ID: ${POSTIZ_INSTAGRAM_WORKSPACE_ID:-}
+      CHANNEL_MONITOR_INTERVAL_MS: ${LOCAL_RECONCILE_INTERVAL_MS:-0}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_BROWSER_ENDPOINT: ${S3_BROWSER_ENDPOINT:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
     volumes:
       - clip_network_data:/app/apps/api/data
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:4100/api/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4100/api/health"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -29,12 +49,12 @@ services:
       args:
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:4100}
     ports:
-      - "3100:3100"
+      - "127.0.0.1:${LOCAL_WEB_PORT:-3100}:3100"
     depends_on:
       api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3100/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3100/"]
       interval: 15s
       timeout: 5s
       retries: 3

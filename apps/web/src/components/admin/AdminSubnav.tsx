@@ -8,6 +8,7 @@ const ADMIN_TABS = [
   { href: '/admin', label: 'Overview' },
   { href: '/admin/users', label: 'Users' },
   { href: '/admin/workspaces', label: 'Workspaces' },
+  { href: '/admin/integrations', label: 'Integrations' },
   { href: '/admin/subscriptions', label: 'Revenue & Plans' },
   { href: '/admin/operations', label: 'Jobs & Ops' },
   { href: '/admin/security', label: 'Security & Audit' },

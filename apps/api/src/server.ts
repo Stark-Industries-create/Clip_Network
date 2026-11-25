@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import { PrismaClient } from '@prisma/client';
 import {
@@ -12,6 +12,7 @@ import {
   CompleteOnboardingRequestSchema,
   CreateApiKeyRequestSchema,
   CreateCreatorRequestSchema,
+  SpokenLanguageSchema,
   CreateRouteRuleRequestSchema,
   CreateSocialAccountRequestSchema,
   CreateSupportTicketRequestSchema,
@@ -22,6 +23,7 @@ import {
   LoginRequestSchema,
   NotificationPreferencesSchema,
   RegisterRequestSchema,
+  RegisterSourceVideoSchema,
   ResetPasswordRequestSchema,
   SAAS_PLANS,
   ToggleAutoPublishRequestSchema,
@@ -33,6 +35,7 @@ import {
 import { encryptSecret } from '@clip-network/shared/crypto';
 import {
   alignTranscriptToSpeechWindows,
+  assToWebVtt,
   buildAutoSfxCuesForCuts,
   buildWordSyncedAss,
   SFX_PRESETS,
@@ -58,15 +61,45 @@ import {
   resolvePlanTierFromPriceId,
 } from './integrations/stripe.js';
 import { isLiveEmailConfigured, sendTransactionalEmail } from './integrations/email.js';
-import { dispatchSocialPublish } from './integrations/publishing.js';
+import { renderStoredClip } from './services/render-clip.js';
+import { publishClipPost } from './services/publish-clip.js';
+import { refreshStaleMetrics } from './services/post-metrics.js';
 import {
+  buildSourceBundlePrefix,
   buildTenantClipObjectKey,
   createPresignedS3Url,
   getS3StorageConfig,
 } from './integrations/storage.js';
 import { ensureCurrentBillingPeriod, getUtcBillingMonthStart } from './billing-period.js';
+import { isCreatorPlatformUrl, resolveSourceConnectorWorkspace } from './integrations/source-connector.js';
+import { registerDirectSocialRoutes } from './integrations/direct-social-routes.js';
+import { registerInstagramRoutes } from './integrations/instagram-connect.js';
+import { registerGoogleAuthRoutes } from './integrations/google-auth.js';
 import { scanWorkspaceChannels } from './services/channel-monitor.js';
+import { readTranscript } from './services/source-automation.js';
 import { registerSuperAdminControlCenterRoutes } from './admin-routes.js';
+import { refreshPlatformSettings } from './platform-settings.js';
+import { registerAdminIntegrationRoutes } from './admin-integrations.js';
+import { refreshCreatorProfile } from './services/channel-profile.js';
+import { embedFor, fetchSourceVideoStats } from './services/video-details.js';
+
+/** Social account fields safe to return to browsers: never the encrypted token. */
+const SAFE_SOCIAL_ACCOUNT = {
+  select: {
+    id: true, workspaceId: true, platform: true, accountName: true, accountHandle: true, avatarUrl: true,
+    integrationMode: true, autoPublishApproved: true, timezone: true, createdAt: true, updatedAt: true,
+  },
+} as const;
+
+/** Fetches the channel's profile photo, waiting at most a few seconds so saving stays responsive. */
+async function withChannelPhoto<T extends { id: string; platform: string; channelUrl: string; avatarUrl: string | null }>(prisma: PrismaClient, creator: T): Promise<T> {
+  if (process.env['NODE_ENV'] === 'test') return creator;
+  const profile = await Promise.race([
+    refreshCreatorProfile(prisma, creator),
+    new Promise<null>((resolve) => setTimeout(resolve, 6_000, null)),
+  ]);
+  return profile?.avatarUrl ? { ...creator, avatarUrl: profile.avatarUrl } : creator;
+}
 
 function slugifyWorkspace(name: string): string {
   const base = name
@@ -79,13 +112,20 @@ function slugifyWorkspace(name: string): string {
 
 export function buildServer(prisma: PrismaClient): FastifyInstance {
   const isProd = process.env['NODE_ENV'] === 'production';
+  // Behind proxies (Caddy then nginx in production) every request would otherwise appear to come
+  // from the proxy, so per-IP limits like sign-in throttling would be shared by all users.
+  // TRUST_PROXY_HOPS is how many proxies sit in front of the API; client X-Forwarded-For beyond them is ignored.
+  const trustedHops = Number(process.env['TRUST_PROXY_HOPS'] ?? 0);
   const app = Fastify({
+    ...(Number.isSafeInteger(trustedHops) && trustedHops > 0
+      ? { trustProxy: (_address: string, hop: number) => hop < trustedHops } : {}),
     logger: isProd
       ? {
           level: process.env['LOG_LEVEL'] ?? 'info',
           redact: [
             'req.headers.authorization',
             'req.headers["x-api-key"]',
+            'req.headers["x-source-connector-token"]',
             'req.headers.cookie',
             '*.password',
             '*.token',
@@ -125,6 +165,8 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       'x-billing-signature',
       'stripe-signature',
     ],
+    // Lets the web player label the caption track with the creator's spoken language.
+    exposedHeaders: ['X-Caption-Language'],
   });
 
   // Preserve exact raw bytes for Stripe webhook HMAC verification while parsing JSON normally
@@ -159,6 +201,9 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       .catch(() => {});
   }
 
+  // Pick up integration credentials a super admin saved, including from another API instance.
+  app.addHook('onRequest', async () => { await refreshPlatformSettings(prisma); });
+
   app.addHook('onSend', async (_request, reply, payload) => {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('X-Frame-Options', 'DENY');
@@ -186,83 +231,35 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     });
   }
 
-  async function executePublishPost(postId: string, workspaceId: string, userId?: string) {
-    const post = await prisma.publishPost.findFirst({
-      where: { id: postId, workspaceId },
-      include: { clipJob: true, socialAccount: true },
+  async function executePublishPost(postId: string, workspaceId: string, userId?: string, sendTikTokDraft = false) {
+    const result = await publishClipPost(prisma, postId, workspaceId, sendTikTokDraft);
+    if (!result?.dispatched || !['PUBLISHED_LIVE', 'PUBLISHED_SANDBOX'].includes(result.post.status)) return result?.post ?? null;
+    const { post: updated } = result;
+    const post = await prisma.publishPost.findUniqueOrThrow({
+      where: { id: updated.id }, include: { clipJob: true, socialAccount: true },
     });
-    if (!post) return null;
-
-    if (!post.clipJob.compliancePassed) {
-      return prisma.publishPost.update({
-        where: { id: post.id },
+    const { executionMode, externalPostId } = updated;
+    // Seed simulated telemetry for sandbox posts.
+    if (updated.status === 'PUBLISHED_SANDBOX') {
+      const seed = post.id.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+      const baseViews = 1200 + (seed % 4800) + post.clipJob.complianceScore * 25;
+      const baseLikes = Math.round(baseViews * (0.06 + ((seed % 5) * 0.01)));
+      const baseComments = Math.round(baseLikes * 0.09);
+      const baseShares = Math.round(baseLikes * 0.16);
+      await prisma.postMetricSnapshot.create({
         data: {
-          status: 'BLOCKED',
-          errorMessage: 'Blocked by Creator Campaign Compliance Gate.',
+          workspaceId,
+          publishPostId: updated.id,
+          views: baseViews,
+          likes: baseLikes,
+          comments: baseComments,
+          shares: baseShares,
+          watchTimeAvgSec: Math.round(Math.min(post.clipJob.durationSec, 11 + (seed % 14)) * 10) / 10,
+          completionRatePct: Math.min(96, 52 + (seed % 34)),
+          sourceMode: 'SANDBOX_SIMULATED',
         },
       });
     }
-
-    if (post.status === 'PUBLISHED_SANDBOX' || post.status === 'PUBLISHED_LIVE') {
-      return post; // Idempotent replay
-    }
-
-    const dispatch = await dispatchSocialPublish({
-      platform: post.platform,
-      accountHandle: post.socialAccount.accountHandle,
-      encryptedToken: post.socialAccount.encryptedToken,
-      captionText: post.captionText,
-      idempotencyKey: post.idempotencyKey,
-      mediaUrl: post.clipJob.outputMp4Path,
-      durationSec: post.clipJob.durationSec,
-    });
-
-    if (!dispatch.success) {
-      return prisma.publishPost.update({
-        where: { id: post.id },
-        data: {
-          status: 'FAILED',
-          executionMode: dispatch.executionMode,
-          errorMessage: dispatch.errorMessage ?? 'Publishing failed.',
-        },
-      });
-    }
-
-    const isLive = dispatch.status === 'PUBLISHED_LIVE';
-    const nextStatus = dispatch.status;
-    const executionMode = dispatch.executionMode;
-    const externalPostId = dispatch.externalPostId ?? `sandbox-${randomUUID().slice(0, 8)}`;
-
-    const updated = await prisma.publishPost.update({
-      where: { id: post.id },
-      data: {
-        status: nextStatus,
-        executionMode,
-        externalPostId,
-        publishedAt: new Date(),
-        errorMessage: null,
-      },
-    });
-
-    // Record initial telemetry snapshot for published video (honestly labeled SANDBOX_SIMULATED vs LIVE_PLATFORM_API)
-    const seed = post.id.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
-    const baseViews = 1200 + (seed % 4800) + post.clipJob.complianceScore * 25;
-    const baseLikes = Math.round(baseViews * (0.06 + ((seed % 5) * 0.01)));
-    const baseComments = Math.round(baseLikes * 0.09);
-    const baseShares = Math.round(baseLikes * 0.16);
-    await prisma.postMetricSnapshot.create({
-      data: {
-        workspaceId,
-        publishPostId: updated.id,
-        views: baseViews,
-        likes: baseLikes,
-        comments: baseComments,
-        shares: baseShares,
-        watchTimeAvgSec: Math.round(Math.min(post.clipJob.durationSec, 11 + (seed % 14)) * 10) / 10,
-        completionRatePct: Math.min(96, 52 + (seed % 34)),
-        sourceMode: isLive ? 'LIVE_PLATFORM_API' : 'SANDBOX_SIMULATED',
-      },
-    });
 
     await logAudit(
       'PUBLISH_POST_EXECUTED',
@@ -285,6 +282,16 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
   // 0. Health & Public Catalog
   // ============================================================================
 
+  app.get('/api/livez', async () => ({ success: true }));
+  app.get('/api/readyz', async (_request, reply) => {
+    try {
+      await prisma.directSocialConnection.findFirst({ select: { stateHash: true } });
+      return { success: true };
+    } catch {
+      return reply.code(503).send({ success: false, error: 'Database or schema is unavailable.' });
+    }
+  });
+
   app.get('/api/health', async () => {
     await prisma.$queryRaw`SELECT 1`;
     return {
@@ -292,7 +299,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       service: '@clip-network/api',
       version: '2.1.0-commercial',
       database: 'connected',
-      billingMode: isStripeLiveConfigured() ? 'STRIPE_LIVE' : 'SANDBOX_WEBHOOK',
+      billingMode: isStripeLiveConfigured() ? 'STRIPE_LIVE' : isProd ? 'DISABLED' : 'SANDBOX_WEBHOOK',
       publishingMode: process.env['POSTIZ_API_KEY']?.trim() ? 'LIVE_OAUTH' : 'SANDBOX_SIMULATED',
       emailMode: isLiveEmailConfigured() ? 'RESEND_LIVE' : 'SANDBOX_LOG',
       storageMode: getS3StorageConfig() ? 'S3_LIVE' : 'LOCAL_SANDBOX',
@@ -339,10 +346,6 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       });
     }
 
-    const superAdminEmail = process.env['SUPER_ADMIN_EMAIL']?.trim().toLowerCase();
-    const systemRole =
-      superAdminEmail && superAdminEmail === normalizedEmail ? 'SUPER_ADMIN' : 'USER';
-
     const verificationToken = generateOpaqueToken(24);
     const sessionToken = generateOpaqueToken(32);
     const workspaceName = d.workspaceName?.trim() || `${d.name.split(' ')[0]}'s Studio`;
@@ -354,7 +357,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
           email: normalizedEmail,
           name: d.name,
           passwordHash: hashPassword(d.password),
-          systemRole,
+          systemRole: 'USER',
           emailVerificationToken: sha256Hex(verificationToken),
           termsAcceptedAt: new Date(),
           onboardingCompleted: false,
@@ -802,7 +805,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     if (!ctx) return;
     const creators = await prisma.creatorAccount.findMany({
       where: { workspaceId: ctx.workspaceId },
-      include: { routes: { include: { socialAccount: true } }, _count: { select: { clips: true } } },
+      include: { routes: { include: { socialAccount: SAFE_SOCIAL_ACCOUNT } }, _count: { select: { clips: true, channelVideos: true } } },
       orderBy: { createdAt: 'desc' },
     });
     return {
@@ -843,7 +846,16 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
         error: urlCheck.reason,
       });
     }
-    const created = await prisma.creatorAccount.create({
+    if (!isCreatorPlatformUrl(d.platform, d.channelUrl)) {
+      return reply.status(400).send({ success: false, errorCode: 'CHANNEL_URL_PLATFORM', error: `Use a ${d.platform.toLowerCase()} channel URL for this creator.` });
+    }
+    const duplicate = await prisma.creatorAccount.findFirst({
+      where: { workspaceId: ctx.workspaceId, handle: d.handle.toLowerCase() }, select: { id: true },
+    });
+    if (duplicate) {
+      return reply.status(409).send({ success: false, errorCode: 'CREATOR_EXISTS', error: 'This creator is already tagged in your workspace.', data: duplicate });
+    }
+    const created = await withChannelPhoto(prisma, await prisma.creatorAccount.create({
       data: {
         workspaceId: ctx.workspaceId,
         handle: d.handle.toLowerCase(),
@@ -857,9 +869,10 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
         defaultLayout: d.defaultLayout,
         defaultCaptionStyle: d.defaultCaptionStyle,
         enableSfx: d.enableSfx,
+        spokenLanguage: d.spokenLanguage,
         facecamCropJson: d.facecamCrop ? JSON.stringify(d.facecamCrop) : null,
       },
-    });
+    }));
     await logAudit(
       'CREATOR_TAGGED',
       'CreatorAccount',
@@ -882,6 +895,13 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
   // ============================================================================
   // 4. Tenant-Scoped Linked Social Accounts (AES-256-GCM Encrypted Vault)
   // ============================================================================
+
+  registerInstagramRoutes(app, prisma);
+  registerDirectSocialRoutes(app, prisma);
+  registerGoogleAuthRoutes(app, prisma, {
+    logAudit, trackConversion, slugifyWorkspace,
+    allowRequest: (key) => authRateLimiter.check(key).allowed,
+  });
 
   app.get('/api/v1/social-accounts', async (request, reply) => {
     const ctx = await requireAuth(prisma, request, reply, 'VIEWER');
@@ -919,6 +939,9 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     }
 
     const d = parsed.data;
+    if (d.platform !== 'X' && d.accessToken) {
+      return reply.status(400).send({ success: false, error: 'Use direct authorization to connect this live destination.' });
+    }
     const encryptedToken = d.accessToken ? encryptSecret(d.accessToken) : null;
     const postizKey = process.env['POSTIZ_API_KEY']?.trim();
     const integrationMode =
@@ -997,7 +1020,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     if (!ctx) return;
     const routes = await prisma.creatorRouteRule.findMany({
       where: { workspaceId: ctx.workspaceId },
-      include: { creator: true, socialAccount: true },
+      include: { creator: true, socialAccount: SAFE_SOCIAL_ACCOUNT },
       orderBy: { createdAt: 'desc' },
     });
     return {
@@ -1038,7 +1061,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
         hashtagsJson: JSON.stringify(d.hashtags),
         enabled: d.enabled,
       },
-      include: { creator: true, socialAccount: true },
+      include: { creator: true, socialAccount: SAFE_SOCIAL_ACCOUNT },
     });
     await logAudit(
       'CREATOR_ROUTE_LINKED',
@@ -1065,7 +1088,9 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       where: { workspaceId: ctx.workspaceId },
       include: {
         creator: true,
-        publishPosts: { include: { socialAccount: true } },
+        sourceVideo: { select: { id: true, title: true, videoUrl: true, thumbnailUrl: true } },
+        // Never send account tokens to the browser.
+        publishPosts: { include: { socialAccount: SAFE_SOCIAL_ACCOUNT } },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -1118,6 +1143,13 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       return reply.status(404).send({ success: false, error: 'Creator account not found' });
     }
 
+    const requiresRender = process.env['NODE_ENV'] === 'production' || Boolean(getS3StorageConfig());
+    if (d.endSec <= d.startSec || (requiresRender && d.endSec - d.startSec > 180)) {
+      return reply.status(400).send({ success: false, error: 'Choose a positive clip duration of up to 180 seconds.' });
+    }
+    if (requiresRender && !d.transcriptText?.trim()) {
+      return reply.status(400).send({ success: false, error: 'Provide a transcript for compliance review.' });
+    }
     const startedAt = Date.now();
     const executionLogs: string[] = [
       `[${new Date().toISOString()}] QUEUED: Stream ingest accepted for @${creator.handle}`,
@@ -1167,10 +1199,15 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     );
 
     const durationMs = Math.max(1, Date.now() - startedAt);
-    executionLogs.push(`[${new Date().toISOString()}] COMPLETED in ${durationMs}ms`);
+    executionLogs.push(requiresRender ? 'Waiting for source MP4 upload' : 'Sandbox metadata generated');
 
-    const [clipJob] = await prisma.$transaction([
-      prisma.clipJob.create({
+    const clipJob = await prisma.$transaction(async (tx) => {
+      const reserved = await tx.workspace.updateMany({
+        where: { id: ctx.workspaceId, clipsUsedThisPeriod: { lt: tx.workspace.fields.monthlyClipLimit } },
+        data: { clipsUsedThisPeriod: { increment: 1 } },
+      });
+      if (!reserved.count) return null;
+      return tx.clipJob.create({
         data: {
           workspaceId: ctx.workspaceId,
           creatorId: creator.id,
@@ -1185,7 +1222,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
           enableSfx,
           sfxCuesJson: JSON.stringify(sfxCues),
           assScript,
-          executionStatus: 'COMPLETED',
+          executionStatus: requiresRender ? 'PENDING' : 'COMPLETED',
           executionLogsJson: JSON.stringify(executionLogs),
           durationMs,
           compliancePassed: compliance.passed,
@@ -1193,12 +1230,11 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
           complianceReportJson: JSON.stringify(compliance),
           approvalStatus: compliance.passed ? 'AWAITING_APPROVAL' : 'DISQUALIFIED',
         },
-      }),
-      prisma.workspace.update({
-        where: { id: ctx.workspaceId },
-        data: { clipsUsedThisPeriod: { increment: 1 } },
-      }),
-    ]);
+      });
+    });
+    if (!clipJob) {
+      return reply.status(402).send({ success: false, errorCode: 'QUOTA_EXCEEDED', error: 'Monthly clip quota reached.' });
+    }
 
     const routedPosts = [];
     if (compliance.passed) {
@@ -1226,7 +1262,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
           },
         });
 
-        if (route.socialAccount.autoPublishApproved) {
+        if (!requiresRender && route.socialAccount.autoPublishApproved) {
           const published = await executePublishPost(post.id, ctx.workspaceId, ctx.userId);
           if (published) routedPosts.push(published);
         } else {
@@ -1274,20 +1310,24 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     if (!clip) {
       return reply.status(404).send({ success: false, error: 'Clip not found' });
     }
+    if (clip.executionStatus === 'RUNNING') {
+      return reply.status(409).send({ success: false, error: 'Wait for the current render to finish.' });
+    }
     const logs = JSON.parse(clip.executionLogsJson) as string[];
     logs.push(`[${new Date().toISOString()}] CANCELLED by user ${ctx.email}`);
-    const updated = await prisma.clipJob.update({
-      where: { id: clip.id },
-      data: {
-        executionStatus: 'CANCELLED',
-        approvalStatus: 'REJECTED',
-        executionLogsJson: JSON.stringify(logs),
-      },
+    const updated = await prisma.$transaction(async (tx) => {
+      const cancelled = await tx.clipJob.updateMany({
+        where: { id: clip.id, executionStatus: { not: 'RUNNING' } },
+        data: { executionStatus: 'CANCELLED', approvalStatus: 'REJECTED', executionLogsJson: JSON.stringify(logs) },
+      });
+      if (!cancelled.count) return null;
+      await tx.publishPost.updateMany({
+        where: { clipJobId: clip.id, workspaceId: ctx.workspaceId, status: { in: ['AWAITING_APPROVAL', 'FAILED'] } },
+        data: { status: 'BLOCKED', errorMessage: 'Execution cancelled by user.' },
+      });
+      return tx.clipJob.findUniqueOrThrow({ where: { id: clip.id } });
     });
-    await prisma.publishPost.updateMany({
-      where: { clipJobId: clip.id, workspaceId: ctx.workspaceId, status: 'AWAITING_APPROVAL' },
-      data: { status: 'BLOCKED', errorMessage: 'Execution cancelled by user.' },
-    });
+    if (!updated) return reply.status(409).send({ success: false, error: 'A render is in progress.' });
     return { success: true, data: { ...updated, executionLogs: logs } };
   });
 
@@ -1301,18 +1341,40 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     if (!clip) {
       return reply.status(404).send({ success: false, error: 'Clip not found' });
     }
-    const logs = JSON.parse(clip.executionLogsJson) as string[];
-    logs.push(`[${new Date().toISOString()}] RETRIED by user ${ctx.email} -> COMPLETED`);
-    const updated = await prisma.clipJob.update({
-      where: { id: clip.id },
-      data: {
-        executionStatus: 'COMPLETED',
-        approvalStatus: clip.compliancePassed ? 'AWAITING_APPROVAL' : 'DISQUALIFIED',
-        errorMessage: null,
-        executionLogsJson: JSON.stringify(logs),
-      },
+    const storage = getS3StorageConfig();
+    if (!storage) return reply.status(503).send({ success: false, error: 'Media storage is unavailable.' });
+    if (clip.automationSourceKey) {
+      const queued = await prisma.$transaction(async (tx) => {
+        const updated = await tx.clipJob.updateMany({
+          where: {
+            id: clip.id, workspaceId: ctx.workspaceId, creator: { autoMonitorEnabled: true },
+            OR: [
+              { executionStatus: { in: ['PENDING', 'QUEUED', 'FAILED', 'TIMED_OUT', 'CANCELLED'] } },
+              { executionStatus: 'COMPLETED', outputMp4Path: null },
+            ],
+          },
+          data: { executionStatus: 'QUEUED', errorMessage: null },
+        });
+        if (!updated.count) return null;
+        await tx.channelVideo.updateMany({
+          where: { workspaceId: ctx.workspaceId, ...(clip.sourceVideoId ? { id: clip.sourceVideoId } : { clipJobId: clip.id }) },
+          data: { detectionStatus: 'PROCESSING' },
+        });
+        return tx.clipJob.findUniqueOrThrow({ where: { id: clip.id } });
+      });
+      if (!queued) return reply.status(409).send({ success: false, error: 'Clip cannot be queued in its current state.' });
+      return reply.status(202).send({ success: true, data: queued });
+    }
+    const updated = await renderStoredClip(prisma, clip, storage);
+    if (!updated) return reply.status(409).send({ success: false, error: 'Clip cannot be rendered in its current state.' });
+    if (updated.executionStatus !== 'COMPLETED') {
+      return reply.status(422).send({ success: false, error: updated.errorMessage ?? 'Render did not complete.' });
+    }
+    const automaticPosts = await prisma.publishPost.findMany({
+      where: { clipJobId: clip.id, status: 'AWAITING_APPROVAL', socialAccount: { autoPublishApproved: true } },
     });
-    return { success: true, data: { ...updated, executionLogs: logs } };
+    for (const post of automaticPosts) await executePublishPost(post.id, ctx.workspaceId, ctx.userId);
+    return { success: true, data: updated };
   });
 
   app.post('/api/v1/clips/:clipId/decision', async (request, reply) => {
@@ -1331,20 +1393,26 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     if (!clip) {
       return reply.status(404).send({ success: false, error: 'Clip not found' });
     }
-    if (!clip.compliancePassed && parsed.data.decision === 'APPROVED') {
+    const requiresMedia = process.env['NODE_ENV'] === 'production' || Boolean(getS3StorageConfig());
+    if (parsed.data.decision === 'APPROVED' && (
+      clip.executionStatus !== 'COMPLETED' || !clip.compliancePassed || (requiresMedia && !clip.outputMp4Path)
+    )) {
       return reply.status(400).send({
         success: false,
-        error: 'Cannot approve a clip that failed Creator Campaign Compliance Gate.',
+        error: 'Approval requires a completed, compliant clip with playable media.',
       });
     }
 
-    const updatedClip = await prisma.clipJob.update({
-      where: { id: clip.id },
+    const decided = await prisma.clipJob.updateMany({
+      where: { id: clip.id, executionStatus: 'COMPLETED', approvalStatus: { in: ['AWAITING_APPROVAL', 'NEEDS_REVIEW'] } },
       data: {
         approvalStatus: parsed.data.decision,
         approvedAt: parsed.data.decision === 'APPROVED' ? new Date() : null,
       },
     });
+
+    if (!decided.count) return reply.status(409).send({ success: false, error: 'Clip is no longer awaiting review.' });
+    const updatedClip = await prisma.clipJob.findUniqueOrThrow({ where: { id: clip.id } });
 
     const publishedPosts = [];
     if (parsed.data.decision === 'APPROVED') {
@@ -1376,7 +1444,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     if (!ctx) return;
     const posts = await prisma.publishPost.findMany({
       where: { workspaceId: ctx.workspaceId },
-      include: { clipJob: { include: { creator: true } }, socialAccount: true },
+      include: { clipJob: { include: { creator: true } }, socialAccount: SAFE_SOCIAL_ACCOUNT },
       orderBy: { createdAt: 'desc' },
     });
     return { success: true, data: posts };
@@ -1386,8 +1454,12 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     const ctx = await requireAuth(prisma, request, reply, 'MEMBER');
     if (!ctx) return;
     const { postId } = request.params as { postId: string };
-    const res = await executePublishPost(postId, ctx.workspaceId, ctx.userId);
+    const body = (request.body ?? {}) as { sendTikTokDraft?: boolean };
+    const res = await executePublishPost(postId, ctx.workspaceId, ctx.userId, ctx.authMethod === 'SESSION' && body.sendTikTokDraft === true);
     if (!res) return reply.status(404).send({ success: false, error: 'Post not found' });
+    if (!['SUBMITTED', 'PUBLISHED_LIVE', 'PUBLISHED_SANDBOX'].includes(res.status)) {
+      return reply.status(409).send({ success: false, error: res.errorMessage ?? 'Post is not eligible for publishing.' });
+    }
     return { success: true, data: res };
   });
 
@@ -1435,19 +1507,25 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       if (!workspace) {
         return reply.status(404).send({ success: false, error: 'Workspace not found' });
       }
-      const liveSession = await createStripeCheckoutSession({
-        workspaceId: workspace.id,
-        workspaceName: workspace.name,
-        customerEmail: ctx.email,
-        existingCustomerId: workspace.stripeCustomerId,
-        planTier: targetPlan.id,
-        publicAppUrl,
-      });
+      let liveSession: Awaited<ReturnType<typeof createStripeCheckoutSession>>;
+      try {
+        liveSession = await createStripeCheckoutSession({
+          workspaceId: workspace.id,
+          workspaceName: workspace.name,
+          customerEmail: ctx.email,
+          existingCustomerId: workspace.stripeCustomerId,
+          planTier: targetPlan.id,
+          publicAppUrl,
+        });
+      } catch (error) {
+        request.log.error({ err: error }, 'Stripe checkout failed');
+        return reply.status(502).send({ success: false, error: 'Stripe could not start checkout. Try again shortly.' });
+      }
       if (!liveSession) {
         return reply.status(503).send({
           success: false,
           errorCode: 'STRIPE_PRICE_NOT_CONFIGURED',
-          error: `STRIPE_PRICE_${targetPlan.id} is not configured on the server.`,
+          error: 'This plan has no Stripe price yet. Ask the platform admin to finish Stripe setup.',
         });
       }
       if (!workspace.stripeCustomerId) {
@@ -1475,6 +1553,8 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
         },
       };
     }
+
+    if (isProd) return reply.code(503).send({ success: false, errorCode: 'BILLING_NOT_CONFIGURED', error: 'Payments are not set up yet. The platform admin adds Stripe in Control Center, Integrations.' });
 
     // Build a deterministic webhook payload for sandbox testing (never mutates plan directly without signed webhook!)
     const webhookPayload = {
@@ -1600,8 +1680,8 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     } else if (event.type === 'customer.subscription.updated') {
       const sub = event.data.object;
       const workspaceId = sub.metadata?.['workspaceId'];
-      const priceId = sub.items.data[0]?.price?.id;
-      const nextTier = resolvePlanTierFromPriceId(priceId);
+      const price = sub.items.data[0]?.price;
+      const nextTier = resolvePlanTierFromPriceId(price?.id, price);
       if (workspaceId && nextTier) {
         const planDef = SAAS_PLANS[nextTier];
         await prisma.workspace.update({
@@ -1682,15 +1762,25 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       const sub = event.data.object;
       const workspaceId = sub.metadata?.['workspaceId'];
       if (workspaceId) {
-        const ws = await prisma.workspace.update({
-          where: { id: workspaceId },
-          data: {
-            planTier: 'FREE',
-            monthlyClipLimit: SAAS_PLANS.FREE.monthlyClipLimit,
-            subscriptionStatus: 'CANCELLED',
-            stripeSubscriptionId: null,
-          },
-        });
+        const ws = await prisma.workspace.findUnique({ where: { id: workspaceId } });
+        if (!ws || ws.stripeSubscriptionId !== sub.id) return { success: true };
+        await prisma.$transaction([
+          prisma.subscriptionInvoice.create({
+            data: {
+              workspaceId, externalEventId: event.id, planTier: ws.planTier,
+              amountCents: 0, status: 'CANCELLED', providerMode: 'STRIPE_LIVE',
+            },
+          }),
+          prisma.workspace.updateMany({
+            where: { id: workspaceId, stripeSubscriptionId: sub.id },
+            data: {
+              planTier: 'FREE',
+              monthlyClipLimit: SAAS_PLANS.FREE.monthlyClipLimit,
+              subscriptionStatus: 'CANCELLED',
+              stripeSubscriptionId: null,
+            },
+          }),
+        ]);
         const owner = await prisma.workspaceMember.findFirst({
           where: { workspaceId: ws.id, role: 'OWNER' },
           include: { user: true },
@@ -1709,6 +1799,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
   });
 
   app.post('/api/v1/billing/webhook', async (request, reply) => {
+    if (isProd) return reply.code(404).send({ success: false, error: 'Not found.' });
     const signatureHeader =
       typeof request.headers['x-billing-signature'] === 'string'
         ? request.headers['x-billing-signature']
@@ -1813,7 +1904,11 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     if (!ctx) return;
     const currentWs = await prisma.workspace.findUnique({ where: { id: ctx.workspaceId } });
     if (currentWs?.stripeSubscriptionId) {
-      await cancelStripeSubscriptionIfActive(currentWs.stripeSubscriptionId).catch(() => {});
+      try {
+        await cancelStripeSubscriptionIfActive(currentWs.stripeSubscriptionId);
+      } catch {
+        return reply.status(502).send({ success: false, error: 'Stripe cancellation could not be confirmed. Please retry.' });
+      }
     }
     const freePlan = SAAS_PLANS.FREE;
     const updated = await prisma.workspace.update({
@@ -1838,7 +1933,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     });
     if (!clip) return reply.status(404).send({ success: false, error: 'Clip not found' });
 
-    const s3 = getS3StorageConfig();
+    const s3 = getS3StorageConfig(true);
     const objectKey = buildTenantClipObjectKey(ctx.workspaceId, clip.id, 'mp4');
     if (!s3) {
       return {
@@ -1852,16 +1947,42 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       };
     }
 
+    if (!clip.outputMp4Path || clip.executionStatus !== 'COMPLETED') {
+      return { success: true, data: { storageMode: 'S3_LIVE', objectKey, signedUrl: null } };
+    }
     const signedUrl = createPresignedS3Url({
       config: s3,
       method: 'GET',
-      objectKey,
+      objectKey: clip.outputMp4Path,
       expiresSec: 900,
     });
     return {
       success: true,
-      data: { storageMode: 'S3_LIVE', objectKey, signedUrl, expiresSec: 900 },
+      data: { storageMode: 'S3_LIVE', objectKey: clip.outputMp4Path, signedUrl, expiresSec: 900 },
     };
+  });
+
+  // The burned-in captions as a WebVTT track, for players and screen readers. Built from the clip's
+  // stored ASS, which rendering replaces with the final word-timed captions, so the two always match.
+  app.get('/api/v1/clips/:clipId/captions.vtt', async (request, reply) => {
+    const ctx = await requireAuth(prisma, request, reply, 'VIEWER');
+    if (!ctx) return;
+    const { clipId } = request.params as { clipId: string };
+    const clip = await prisma.clipJob.findFirst({
+      where: { id: clipId, workspaceId: ctx.workspaceId },
+      select: { assScript: true, executionStatus: true, creator: { select: { spokenLanguage: true } } },
+    });
+    if (!clip || clip.executionStatus !== 'COMPLETED') {
+      return reply.status(404).send({ success: false, error: 'No captions for this clip yet.' });
+    }
+    const vtt = assToWebVtt(clip.assScript);
+    if (vtt === 'WEBVTT\n\n') return reply.status(404).send({ success: false, error: 'This clip has no captions.' });
+    const language = clip.creator.spokenLanguage === 'auto' ? undefined : clip.creator.spokenLanguage;
+    return reply
+      .header('Content-Type', 'text/vtt; charset=utf-8')
+      .header('Cache-Control', 'private, no-store')
+      .header('X-Caption-Language', language ?? 'und')
+      .send(vtt);
   });
 
   app.post('/api/v1/clips/:clipId/upload-url', async (request, reply) => {
@@ -1874,7 +1995,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     if (!clip) return reply.status(404).send({ success: false, error: 'Clip not found' });
 
     const body = (request.body ?? {}) as { ext?: string };
-    const ext = body.ext === 'png' || body.ext === 'jpg' || body.ext === 'ass' ? body.ext : 'mp4';
+    const ext = body.ext === 'png' || body.ext === 'jpg' || body.ext === 'ass' ? body.ext : 'source.mp4';
     const objectKey = buildTenantClipObjectKey(ctx.workspaceId, clip.id, ext);
     const s3 = getS3StorageConfig();
     if (!s3) {
@@ -2123,7 +2244,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     const creator = await prisma.creatorAccount.findFirst({
       where: { id, workspaceId: ctx.workspaceId },
       include: {
-        routes: { include: { socialAccount: true } },
+        routes: { include: { socialAccount: SAFE_SOCIAL_ACCOUNT } },
         clips: { orderBy: { createdAt: 'desc' }, take: 20 },
       },
     });
@@ -2158,18 +2279,30 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       bannedKeywords?: string[];
       disallowLogos?: boolean;
       enableSfx?: boolean;
+      autoMonitorEnabled?: boolean;
+      spokenLanguage?: string;
     };
-    const updated = await prisma.creatorAccount.update({
+    if (body.channelUrl !== undefined && (!assertSafeExternalUrl(body.channelUrl).safe || !isCreatorPlatformUrl(existing.platform, body.channelUrl))) {
+      return reply.status(400).send({ success: false, errorCode: 'CHANNEL_URL_PLATFORM', error: `Use a ${existing.platform.toLowerCase()} channel URL for this creator.` });
+    }
+    if (body.spokenLanguage !== undefined && !SpokenLanguageSchema.safeParse(body.spokenLanguage).success) {
+      return reply.status(400).send({ success: false, error: 'Use auto or a language code such as en, ne or hi.' });
+    }
+    const channelChanged = Boolean(body.channelUrl && body.channelUrl !== existing.channelUrl);
+    let updated = await prisma.creatorAccount.update({
       where: { id: existing.id },
       data: {
         ...(body.displayName ? { displayName: body.displayName } : {}),
-        ...(body.channelUrl ? { channelUrl: body.channelUrl } : {}),
+        ...(channelChanged ? { channelUrl: body.channelUrl, discoveryCursor: null, sourceAccessError: null, avatarUrl: null } : {}),
         ...(body.requiredTopics ? { requiredTopicsJson: JSON.stringify(body.requiredTopics) } : {}),
         ...(body.bannedKeywords ? { bannedKeywordsJson: JSON.stringify(body.bannedKeywords) } : {}),
         ...(typeof body.disallowLogos === 'boolean' ? { disallowLogos: body.disallowLogos } : {}),
         ...(typeof body.enableSfx === 'boolean' ? { enableSfx: body.enableSfx } : {}),
+        ...(typeof body.autoMonitorEnabled === 'boolean' ? { autoMonitorEnabled: body.autoMonitorEnabled } : {}),
+        ...(body.spokenLanguage ? { spokenLanguage: body.spokenLanguage } : {}),
       },
     });
+    if (channelChanged || !updated.avatarUrl) updated = await withChannelPhoto(prisma, updated);
     await logAudit('CREATOR_UPDATED', 'CreatorAccount', updated.id, { displayName: updated.displayName }, ctx.workspaceId, ctx.userId);
     return {
       success: true,
@@ -2229,7 +2362,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
         ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
         ...(typeof body.minComplianceScore === 'number' ? { minComplianceScore: body.minComplianceScore } : {}),
       },
-      include: { creator: true, socialAccount: true },
+      include: { creator: true, socialAccount: SAFE_SOCIAL_ACCOUNT },
     });
     return { success: true, data: { ...updated, hashtags: JSON.parse(updated.hashtagsJson) as string[] } };
   });
@@ -2256,7 +2389,8 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       where: { id: clipId, workspaceId: ctx.workspaceId },
       include: {
         creator: true,
-        publishPosts: { include: { socialAccount: true }, orderBy: { createdAt: 'desc' } },
+        sourceVideo: { select: { id: true, title: true, videoUrl: true, thumbnailUrl: true } },
+        publishPosts: { include: { socialAccount: SAFE_SOCIAL_ACCOUNT }, orderBy: { createdAt: 'desc' } },
       },
     });
     if (!clip) {
@@ -2302,27 +2436,196 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
   app.get('/api/v1/monitor/videos', async (request, reply) => {
     const ctx = await requireAuth(prisma, request, reply, 'VIEWER');
     if (!ctx) return;
+    const { creatorId } = request.query as { creatorId?: string };
     const videos = await prisma.channelVideo.findMany({
-      where: { workspaceId: ctx.workspaceId },
-      include: { creator: true },
+      where: { workspaceId: ctx.workspaceId, ...(typeof creatorId === 'string' && creatorId ? { creatorId } : {}) },
+      include: {
+        creator: { select: { id: true, displayName: true, handle: true, platform: true, avatarUrl: true, sourceAccessError: true } },
+        clips: {
+          orderBy: { startSec: 'asc' },
+          select: {
+            id: true, executionStatus: true, approvalStatus: true, startSec: true, endSec: true, contentType: true,
+            framingMode: true, qualityIssue: true, errorMessage: true,
+            publishPosts: { select: { id: true, platform: true, status: true, errorMessage: true, externalPostId: true } },
+          },
+        },
+      },
       orderBy: { detectedAt: 'desc' },
-      take: 30,
+      take: creatorId ? 100 : 30,
     });
     return { success: true, data: videos };
+  });
+
+  /** One detected recording: its platform statistics, player embed, clips and how they performed. */
+  app.get('/api/v1/monitor/videos/:videoId/details', async (request, reply) => {
+    const ctx = await requireAuth(prisma, request, reply, 'VIEWER');
+    if (!ctx) return;
+    const { videoId } = request.params as { videoId: string };
+    const video = await prisma.channelVideo.findFirst({
+      where: { id: videoId, workspaceId: ctx.workspaceId },
+      include: {
+        creator: { select: { id: true, displayName: true, handle: true, platform: true, avatarUrl: true, channelUrl: true } },
+        clips: {
+          orderBy: { startSec: 'asc' },
+          select: {
+            id: true, title: true, startSec: true, endSec: true, durationSec: true, executionStatus: true, approvalStatus: true,
+            qualityIssue: true, complianceScore: true,
+            publishPosts: { select: { id: true, platform: true, status: true, metricSnapshots: { orderBy: { capturedAt: 'desc' }, take: 1 } } },
+          },
+        },
+      },
+    });
+    if (!video) return reply.status(404).send({ success: false, error: 'Video not found.' });
+    const stats = await fetchSourceVideoStats(video.creator.platform, video.externalVideoId);
+    const latest = video.clips.flatMap((clip) => clip.publishPosts.flatMap((post) => post.metricSnapshots.slice(0, 1)));
+    const clipPerformance = latest.reduce((sum, snap) => ({
+      views: sum.views + snap.views, likes: sum.likes + snap.likes, comments: sum.comments + snap.comments, shares: sum.shares + snap.shares,
+    }), { views: 0, likes: 0, comments: 0, shares: 0 });
+    let analysis: Record<string, unknown> = {};
+    try { analysis = JSON.parse(video.analysisCostJson) as Record<string, unknown>; } catch { /* keep empty */ }
+    return {
+      success: true,
+      data: {
+        video: {
+          id: video.id, title: video.title, videoUrl: video.videoUrl, thumbnailUrl: video.thumbnailUrl,
+          externalVideoId: video.externalVideoId, detectionStatus: video.detectionStatus, automationError: video.automationError,
+          publishedAt: video.publishedAt, detectedAt: video.detectedAt, durationSec: video.durationSec,
+        },
+        creator: video.creator,
+        embed: embedFor(video.creator.platform, video.externalVideoId),
+        stats,
+        analysis,
+        clips: video.clips.map(({ publishPosts, ...clip }) => ({ ...clip, posts: publishPosts.length })),
+        clipPerformance: { ...clipPerformance, postsTracked: latest.length },
+      },
+    };
+  });
+
+  /** Asks the worker to analyze a recording it skipped (only the newest is clipped automatically). */
+  app.post('/api/v1/monitor/videos/:videoId/clip', async (request, reply) => {
+    const ctx = await requireAuth(prisma, request, reply, 'MEMBER');
+    if (!ctx) return;
+    const { videoId } = request.params as { videoId: string };
+    const queued = await prisma.channelVideo.updateMany({
+      where: { id: videoId, workspaceId: ctx.workspaceId, clipJobId: null, clips: { none: {} }, detectionStatus: { in: ['SKIPPED', 'DETECTED'] } },
+      data: { detectionStatus: 'DETECTED', nextAutomationAttemptAt: null, automationError: null },
+    });
+    if (!queued.count) return reply.status(409).send({ success: false, error: 'This video is already clipped or being processed.' });
+    await logAudit('VIDEO_QUEUED_FOR_CLIPPING', 'ChannelVideo', videoId, {}, ctx.workspaceId, ctx.userId);
+    return reply.status(202).send({ success: true, data: { id: videoId, detectionStatus: 'DETECTED' } });
+  });
+
+  async function requireSourceWorkspace(request: FastifyRequest, reply: FastifyReply) {
+    const token = request.headers['x-source-connector-token'];
+    if (token === undefined) return (await requireAuth(prisma, request, reply, 'ADMIN'))?.workspaceId ?? null;
+    const workspaceId = typeof token === 'string' ? resolveSourceConnectorWorkspace(token) : null;
+    if (!workspaceId) {
+      void reply.status(401).send({ success: false, error: 'Invalid source connector credential.' });
+    }
+    return workspaceId;
+  }
+
+  app.post('/api/v1/monitor/videos', async (request, reply) => {
+    const workspaceId = await requireSourceWorkspace(request, reply);
+    if (!workspaceId) return;
+    const parsed = RegisterSourceVideoSchema.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ success: false, error: parsed.error.flatten() });
+    const { creatorId, externalVideoId, videoUrl, title, publishedAt } = parsed.data;
+    const connector = request.headers['x-source-connector-token'] !== undefined;
+    const creator = await prisma.creatorAccount.findFirst({
+      where: { id: creatorId, workspaceId, ...(connector ? { autoMonitorEnabled: true } : {}) },
+      select: { platform: true },
+    });
+    if (!creator) return reply.status(404).send({ success: false, error: 'Creator not found.' });
+
+    if (!isCreatorPlatformUrl(creator.platform, videoUrl)) {
+      return reply.status(400).send({ success: false, error: 'Source URL must match the tagged creator platform.' });
+    }
+
+    const recordingStatus = parsed.data.recordingStatus ?? 'REPLAY';
+    const detectionStatus = recordingStatus === 'REPLAY' ? 'DETECTED' : recordingStatus;
+    const video = await prisma.$transaction(async tx => {
+      const stored = await tx.channelVideo.upsert({
+      where: { creatorId_externalVideoId: { creatorId, externalVideoId } },
+      create: {
+        workspaceId, creatorId, externalVideoId, videoUrl, title,
+        publishedAt: new Date(publishedAt), durationSec: 0, detectionStatus, detectionSource: 'CREATOR_CONNECTOR',
+      },
+      update: { externalVideoId },
+      });
+      if (stored.detectionStatus !== detectionStatus && recordingStatus !== 'LIVE') {
+        await tx.channelVideo.updateMany({
+          where: { id: stored.id, clipJobId: null, detectionStatus: { in: recordingStatus === 'REPLAY' ? ['LIVE','FINALIZING'] : ['LIVE'] } },
+          data: { detectionStatus, videoUrl, nextAutomationAttemptAt: null },
+        });
+        return tx.channelVideo.findUniqueOrThrow({ where: { id: stored.id } });
+      }
+      return stored;
+    });
+    return { success: true, data: video };
+  });
+
+  app.post('/api/v1/monitor/videos/:videoId/source-upload', async (request, reply) => {
+    const workspaceId = await requireSourceWorkspace(request, reply);
+    if (!workspaceId) return;
+    const { videoId } = request.params as { videoId: string };
+    const video = await prisma.channelVideo.findFirst({
+      where: {
+        id: videoId, workspaceId, clipJobId: null, detectionStatus: { in: ['DETECTED', 'SKIPPED'] },
+        ...(request.headers['x-source-connector-token'] !== undefined ? { creator: { autoMonitorEnabled: true } } : {}),
+      },
+      select: { id: true, creatorId: true },
+    });
+    if (!video) return reply.status(404).send({ success: false, error: 'No pending source video found.' });
+    const storage = getS3StorageConfig(!request.headers['x-source-connector-token']);
+    if (!storage) return reply.status(503).send({ success: false, error: 'Source storage is unavailable.' });
+    const prefix = buildSourceBundlePrefix(workspaceId, video.creatorId, video.id);
+    return {
+      success: true,
+      data: {
+        videoUploadUrl: createPresignedS3Url({ config: storage, method: 'PUT', objectKey: `${prefix}/source.mp4` }),
+        transcriptUploadUrl: createPresignedS3Url({ config: storage, method: 'PUT', objectKey: `${prefix}/transcript.json` }),
+        expiresSec: 900,
+      },
+    };
+  });
+
+  app.post('/api/v1/monitor/videos/:videoId/queue', async (request, reply) => {
+    const workspaceId = await requireSourceWorkspace(request, reply);
+    if (!workspaceId) return;
+    const { videoId } = request.params as { videoId: string };
+    const video = await prisma.channelVideo.findFirst({
+      where: { id: videoId, workspaceId, creator: { autoMonitorEnabled: true } },
+    });
+    if (!video) return reply.status(404).send({ success: false, error: 'Monitored source not found.' });
+    if (video.clipJobId) return { success: true, data: video };
+    const storage = getS3StorageConfig();
+    if (!storage) return reply.status(503).send({ success: false, error: 'Source storage is unavailable.' });
+
+    const prefix = buildSourceBundlePrefix(workspaceId, video.creatorId, video.id);
+    try {
+      const transcript = await readTranscript(storage, `${prefix}/transcript.json`);
+      if (!transcript?.cues.length) throw new Error('No speech cues supplied');
+    } catch {
+      return reply.status(422).send({ success: false, error: 'Supply a valid timed transcript and highlight range.' });
+    }
+    await prisma.channelVideo.updateMany({
+      where: { id: video.id, workspaceId, clipJobId: null, detectionStatus: { in: ['DETECTED', 'SKIPPED'] } },
+      data: { detectionStatus: 'DETECTED', nextAutomationAttemptAt: null },
+    });
+    return reply.status(202).send({ success: true, data: { id: video.id } });
   });
 
   app.post('/api/v1/monitor/scan', async (request, reply) => {
     const ctx = await requireAuth(prisma, request, reply, 'MEMBER');
     if (!ctx) return;
-    const body = (request.body ?? {}) as { creatorId?: string; autoExecute?: boolean };
+    const body = (request.body ?? {}) as { creatorId?: string };
 
     const result = await scanWorkspaceChannels({
       prisma,
       workspaceId: ctx.workspaceId,
       userId: ctx.userId,
       ...(body.creatorId ? { creatorId: body.creatorId } : {}),
-      ...(typeof body.autoExecute === 'boolean' ? { autoExecute: body.autoExecute } : {}),
-      executePublishPost,
       trackConversion,
       logAudit,
     });
@@ -2330,48 +2633,13 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     return { success: true, data: result };
   });
 
+  // Dashboard refresh: only posts not checked in the last six hours are fetched from their platforms.
+  // Real posts only ever show platform numbers; sandbox posts keep simulated demo data.
   app.post('/api/v1/analytics/sync-metrics', async (request, reply) => {
     const ctx = await requireAuth(prisma, request, reply, 'MEMBER');
     if (!ctx) return;
-
-    const publishedPosts = await prisma.publishPost.findMany({
-      where: {
-        workspaceId: ctx.workspaceId,
-        status: { in: ['PUBLISHED_SANDBOX', 'PUBLISHED_LIVE'] },
-      },
-      include: {
-        clipJob: true,
-        metricSnapshots: { orderBy: { capturedAt: 'desc' }, take: 1 },
-      },
-    });
-
-    const synced = [];
-    for (const post of publishedPosts) {
-      const prev = post.metricSnapshots[0];
-      const seed = post.id.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
-      const deltaViews = 450 + (seed % 1400);
-      const nextViews = (prev?.views ?? 1200) + deltaViews;
-      const nextLikes = (prev?.likes ?? 95) + Math.round(deltaViews * 0.085);
-      const nextComments = (prev?.comments ?? 12) + Math.round(deltaViews * 0.011);
-      const nextShares = (prev?.shares ?? 19) + Math.round(deltaViews * 0.018);
-
-      const snap = await prisma.postMetricSnapshot.create({
-        data: {
-          workspaceId: ctx.workspaceId,
-          publishPostId: post.id,
-          views: nextViews,
-          likes: nextLikes,
-          comments: nextComments,
-          shares: nextShares,
-          watchTimeAvgSec: prev?.watchTimeAvgSec ?? 16.4,
-          completionRatePct: Math.min(98, (prev?.completionRatePct ?? 64) + 1.5),
-          sourceMode: post.status === 'PUBLISHED_LIVE' ? 'LIVE_PLATFORM_API' : 'SANDBOX_SIMULATED',
-        },
-      });
-      synced.push(snap);
-    }
-
-    return { success: true, data: { syncedCount: synced.length } };
+    const result = await refreshStaleMetrics(prisma, ctx.workspaceId);
+    return { success: true, data: { syncedCount: result.refreshed, outcomes: result.outcomes } };
   });
 
   app.get('/api/v1/analytics', async (request, reply) => {
@@ -2384,8 +2652,8 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
         where: { workspaceId: ctx.workspaceId },
         include: {
           clipJob: { include: { creator: true } },
-          socialAccount: true,
-          metricSnapshots: { orderBy: { capturedAt: 'desc' }, take: 1 },
+          socialAccount: SAFE_SOCIAL_ACCOUNT,
+          metricSnapshots: { orderBy: { capturedAt: 'desc' }, take: 20 },
         },
       }),
       prisma.creatorAccount.findMany({
@@ -2395,6 +2663,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       prisma.postMetricSnapshot.findMany({
         where: { workspaceId: ctx.workspaceId },
         orderBy: { capturedAt: 'asc' },
+        include: { publishPost: { select: { status: true } } },
       }),
       prisma.channelVideo.count({ where: { workspaceId: ctx.workspaceId } }),
     ]);
@@ -2414,8 +2683,11 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       posts.length > 0 ? Math.round((publishedCount / posts.length) * 100) : 0;
 
     // Latest snapshot per published post
+    // A real post only counts numbers read from its platform (older builds stored simulated ones).
+    const snapshotFits = (status: string, sourceMode: string) =>
+      status === 'PUBLISHED_LIVE' ? sourceMode === 'LIVE_PLATFORM_API' : sourceMode === 'SANDBOX_SIMULATED';
     const latestMetrics = publishedPosts.map((p) => {
-      const snap = p.metricSnapshots[0];
+      const snap = p.metricSnapshots.find((s) => snapshotFits(p.status, s.sourceMode));
       return {
         postId: p.id,
         title: p.clipJob.title,
@@ -2428,9 +2700,14 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
         shares: snap?.shares ?? 0,
         watchTimeAvgSec: snap?.watchTimeAvgSec ?? 0,
         completionRatePct: snap?.completionRatePct ?? 0,
-        sourceMode: snap?.sourceMode ?? 'SANDBOX_SIMULATED',
+        sourceMode: snap?.sourceMode ?? (p.status === 'PUBLISHED_LIVE' ? 'AWAITING_PLATFORM_METRICS' : 'SANDBOX_SIMULATED'),
+        metricsCheckedAt: p.metricsCheckedAt,
+        metricsError: p.metricsError,
       };
     });
+    const liveCount = latestMetrics.filter((m) => m.sourceMode === 'LIVE_PLATFORM_API').length;
+    const simulatedCount = latestMetrics.filter((m) => m.sourceMode === 'SANDBOX_SIMULATED').length;
+    const timeline = snapshots.filter((s) => snapshotFits(s.publishPost.status, s.sourceMode));
 
     const totalViews = latestMetrics.reduce((s, m) => s + m.views, 0);
     const totalLikes = latestMetrics.reduce((s, m) => s + m.likes, 0);
@@ -2467,8 +2744,8 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
 
     // Time-Series for Recharts AreaChart
     const timeSeries =
-      snapshots.length > 0
-        ? snapshots.slice(-12).map((s, idx) => ({
+      timeline.length > 0
+        ? timeline.slice(-12).map((s, idx) => ({
             label: `Snap ${idx + 1}`,
             views: s.views,
             likes: s.likes,
@@ -2519,15 +2796,15 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
       });
     }
 
-    const hasLiveSnapshots = latestMetrics.some((m) => m.sourceMode === 'LIVE_PLATFORM_API');
-
     return {
       success: true,
       data: {
-        scope: hasLiveSnapshots ? 'LIVE_PLATFORM_TELEMETRY' : 'SANDBOX_SIMULATED_TELEMETRY',
-        disclaimer: hasLiveSnapshots
-          ? 'Metrics reflect synced platform analytics combined with Clip Network pipeline state.'
-          : 'Pipeline metrics are live from PostgreSQL/SQLite. Post views/likes/completion snapshots run in SANDBOX_SIMULATED telemetry mode until live social OAuth analytics tokens are connected.',
+        scope: liveCount && simulatedCount ? 'MIXED_TELEMETRY' : liveCount ? 'LIVE_PLATFORM_METRICS' : 'SANDBOX_SIMULATED_TELEMETRY',
+        disclaimer: liveCount && !simulatedCount
+          ? 'Engagement is read from each platform 24 and 72 hours after publishing, and when this page is opened (at most every 6 hours).'
+          : simulatedCount && !liveCount
+            ? 'Pipeline counts come from workspace activity. Sandbox post engagement is simulated.'
+            : 'Live posts show platform numbers; sandbox posts show simulated engagement.',
         totals: {
           detectedVideosCount,
           totalClips,
@@ -2564,6 +2841,43 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
         })),
       },
     };
+  });
+
+  // Automation settings and usage: recorded hours analyzed this period against the plan, and the
+  // workspace's own auto-publish opt-in (each destination must also allow automatic posting).
+  async function automationSettings(workspaceId: string) {
+    const workspace = await ensureCurrentBillingPeriod(prisma, workspaceId);
+    if (!workspace) return null;
+    const plan = SAAS_PLANS[workspace.planTier as PlanTier] ?? SAAS_PLANS.FREE;
+    return {
+      autoPublishEnabled: workspace.autoPublishEnabled,
+      autoPublishGloballyDisabled: process.env['AUTO_PUBLISH_DISABLED'] === 'true',
+      analysisHoursUsed: Math.round(workspace.analysisSecondsUsed / 36) / 100,
+      monthlyAnalysisHours: plan.monthlyAnalysisHours,
+      maxRecordingHours: plan.maxRecordingHours,
+      workerConcurrency: plan.workerConcurrency,
+    };
+  }
+
+  app.get('/api/v1/workspace/automation', async (request, reply) => {
+    const ctx = await requireAuth(prisma, request, reply, 'VIEWER');
+    if (!ctx) return;
+    const settings = await automationSettings(ctx.workspaceId);
+    if (!settings) return reply.status(404).send({ success: false, error: 'Workspace not found' });
+    return { success: true, data: settings };
+  });
+
+  app.patch('/api/v1/workspace/automation', async (request, reply) => {
+    const ctx = await requireAuth(prisma, request, reply, 'ADMIN');
+    if (!ctx) return;
+    const body = (request.body ?? {}) as { autoPublishEnabled?: unknown };
+    if (typeof body.autoPublishEnabled !== 'boolean') {
+      return reply.status(400).send({ success: false, error: 'Set autoPublishEnabled to true or false.' });
+    }
+    await prisma.workspace.update({ where: { id: ctx.workspaceId }, data: { autoPublishEnabled: body.autoPublishEnabled } });
+    await logAudit('WORKSPACE_AUTO_PUBLISH_CHANGED', 'Workspace', ctx.workspaceId,
+      { autoPublishEnabled: body.autoPublishEnabled }, ctx.workspaceId, ctx.userId);
+    return { success: true, data: await automationSettings(ctx.workspaceId) };
   });
 
   app.get('/api/v1/workspace/members', async (request, reply) => {
@@ -2813,6 +3127,7 @@ export function buildServer(prisma: PrismaClient): FastifyInstance {
     logAudit,
     executePublishPost,
   });
+  registerAdminIntegrationRoutes(app, prisma, logAudit);
 
   return app;
 }

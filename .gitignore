@@ -11,3 +11,12 @@ renders/
 *.wav
 *.mp3
 *.png
+
+# Production secrets and database dumps stay on the server.
+.env.*
+!.env.example
+backups/
+
+# Local tool state (dev keys, browser recordings).
+.claude/
+.playwright-mcp/

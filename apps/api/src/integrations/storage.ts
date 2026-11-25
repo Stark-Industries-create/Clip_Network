@@ -8,8 +8,9 @@ export interface S3StorageConfig {
   secretAccessKey: string;
 }
 
-export function getS3StorageConfig(): S3StorageConfig | null {
-  const endpoint = process.env['S3_ENDPOINT']?.trim();
+export function getS3StorageConfig(browser = false): S3StorageConfig | null {
+  const endpoint = (browser ? process.env['S3_BROWSER_ENDPOINT']?.trim() : undefined) ||
+    process.env['S3_ENDPOINT']?.trim();
   const bucket = process.env['S3_BUCKET']?.trim();
   const accessKeyId = process.env['S3_ACCESS_KEY_ID']?.trim();
   const secretAccessKey = process.env['S3_SECRET_ACCESS_KEY']?.trim();
@@ -29,6 +30,10 @@ export function buildTenantClipObjectKey(workspaceId: string, clipId: string, ex
   return `workspaces/${safeWs}/clips/${safeClip}.${ext}`;
 }
 
+export function buildSourceBundlePrefix(workspaceId: string, creatorId: string, sourceId: string): string {
+  return `workspaces/${workspaceId}/sources/${creatorId}/${sourceId}`;
+}
+
 function hmacSha256(key: Buffer | string, data: string): Buffer {
   return createHmac('sha256', key).update(data, 'utf8').digest();
 }
@@ -39,7 +44,7 @@ function hmacSha256(key: Buffer | string, data: string): Buffer {
  */
 export function createPresignedS3Url(params: {
   config: S3StorageConfig;
-  method: 'GET' | 'PUT';
+  method: 'GET' | 'PUT' | 'HEAD';
   objectKey: string;
   expiresSec?: number;
   now?: Date;

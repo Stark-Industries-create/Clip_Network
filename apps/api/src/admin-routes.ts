@@ -227,11 +227,11 @@ export function registerSuperAdminControlCenterRoutes(
           { name: 'Database', mode: 'CONNECTED', live: true, detail: 'Prisma ORM operational' },
           {
             name: 'Stripe Billing',
-            mode: isStripeLiveConfigured() ? 'STRIPE_LIVE' : 'SANDBOX_WEBHOOK',
+            mode: isStripeLiveConfigured() ? 'STRIPE_LIVE' : 'NOT_CONFIGURED',
             live: isStripeLiveConfigured(),
             detail: isStripeLiveConfigured()
-              ? 'Official Stripe SDK active'
-              : 'HMAC-SHA256 sandbox webhook mode',
+              ? 'Stripe connected'
+              : 'Add Stripe keys in Integrations',
           },
           {
             name: 'Resend Email',

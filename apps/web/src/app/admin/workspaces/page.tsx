@@ -68,6 +68,7 @@ export default function AdminWorkspacesPage() {
       <div className="space-y-4">
         <Input
           placeholder="Search workspaces or owner email..."
+          aria-label="Search workspaces"
           value={q}
           onChange={(e) => setQ(e.target.value)}
           className="max-w-sm h-9 text-xs"
@@ -105,6 +106,7 @@ export default function AdminWorkspacesPage() {
                   </td>
                   <td className="p-3.5 text-right">
                     <select
+                      aria-label={`Plan for ${w.name}`}
                       className="h-8 rounded border border-input bg-background px-2 font-mono text-[11px]"
                       value={w.planTier}
                       onChange={(e) => overridePlan(w.id, e.target.value)}

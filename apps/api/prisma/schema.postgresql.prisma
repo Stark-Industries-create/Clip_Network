@@ -60,6 +60,9 @@ model Workspace {
   stripeSubscriptionId String?
   monthlyClipLimit     Int       @default(10)
   clipsUsedThisPeriod  Int       @default(0)
+  analysisSecondsUsed  Float     @default(0) // recorded seconds analyzed this billing period
+  autoPublishEnabled   Boolean   @default(false) // workspace opt-in; each destination still needs autoPublishApproved
+  lastServedAt         DateTime? // fair scheduling: least recently served workspace goes first
   periodResetAt        DateTime  @default(now())
   primaryPlatform      String    @default("TWITCH")
   createdAt            DateTime  @default(now())
@@ -186,7 +189,12 @@ model CreatorAccount {
   displayName         String
   platform            String    // TWITCH, YOUTUBE, KICK
   channelUrl          String
+  avatarUrl           String? // channel profile photo from the platform
   autoMonitorEnabled  Boolean   @default(true)
+  discoveryCursor     String?
+  sourceAccessError   String?
+  spokenLanguage      String    @default("auto") // whisper code: auto, en, ne, hi
+  sourceAccessCheckedAt DateTime?
   lastPolledAt        DateTime?
   tagsJson            String    @default("[]")
   requiredTopicsJson  String    @default("[]")
@@ -215,6 +223,8 @@ model SocialAccount {
   accountName         String
   accountHandle       String
   encryptedToken      String?
+  directAccountId     String?
+  avatarUrl           String? // profile photo returned by the provider at connection time
   autoPublishApproved Boolean  @default(false) // Human approval gate by default
   timezone            String   @default("UTC")
   integrationMode     String   @default("SANDBOX_SIMULATED") // SANDBOX_SIMULATED or LIVE_OAUTH
@@ -226,6 +236,7 @@ model SocialAccount {
   publishPosts PublishPost[]
 
   @@unique([workspaceId, platform, accountHandle])
+  @@unique([workspaceId, platform, directAccountId])
   @@index([workspaceId])
 }
 
@@ -264,6 +275,18 @@ model ClipJob {
   sfxCuesJson          String    @default("[]")
   assScript            String
   outputMp4Path        String?
+  automationSourceKey  String?
+  sourceVideoId        String?
+  sourceVideo          ChannelVideo? @relation(fields: [sourceVideoId], references: [id], onDelete: SetNull)
+  sourceOffsetSec      Float @default(0)
+  sourceChunkCount     Int    @default(1)
+  contentType          String @default("CONVERSATION") // CONVERSATION, GAMEPLAY, COMMENTARY
+  framingMode          String @default("AUTO") // AUTO, WIDE
+  sourceSectionUrl     String? // platform URL; render downloads only [sourceOffsetSec, endSec] of it
+  speakerTurnsJson     String @default("[]") // clip-relative [{ start, end, speaker }]
+  renderAttempts       Int    @default(0)
+  qualityIssue         String?
+  @@index([sourceVideoId])
   executionStatus      String    @default("COMPLETED") // PENDING, QUEUED, RUNNING, COMPLETED, FAILED, CANCELLED, TIMED_OUT
   executionLogsJson    String    @default("[]")
   durationMs           Int       @default(0)
@@ -295,7 +318,11 @@ model PublishPost {
   status          String    @default("AWAITING_APPROVAL") // AWAITING_APPROVAL, SCHEDULED, PUBLISHED_SANDBOX, PUBLISHED_LIVE, FAILED, BLOCKED
   executionMode   String    @default("SANDBOX_SIMULATED")
   externalPostId  String?
+  directProvider  String?
   errorMessage    String?
+  metricsStage    Int       @default(0) // 0 none, 1 after the 24 h snapshot, 2 after the 72 h snapshot
+  metricsCheckedAt DateTime? // last metrics fetch attempt; on-demand refreshes reuse anything newer than 6 h
+  metricsError    String?
   publishedAt     DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
@@ -315,10 +342,16 @@ model ChannelVideo {
   externalVideoId String
   title           String
   videoUrl        String
+  thumbnailUrl    String?
   durationSec     Float    @default(1800)
   detectionSource String   @default("CHANNEL_FEED_SCAN") // YOUTUBE_ATOM_FEED, CHANNEL_FEED_SCAN
   detectionStatus String   @default("DETECTED") // DETECTED, PROCESSING, CLIPPED, SKIPPED
   clipJobId       String?
+  clips           ClipJob[]
+  automationError String?
+  analysisStartedAt DateTime? // set while a worker analyzes this recording
+  analysisCostJson String   @default("{}") // measured cost: transcript source, wall time, whisper seconds
+  nextAutomationAttemptAt DateTime?
   publishedAt     DateTime @default(now())
   detectedAt      DateTime @default(now())
 
@@ -363,4 +396,53 @@ model AuditLog {
   workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
 
   @@index([workspaceId])
+}
+
+// Postiz returns a success flag without an account ID. Keep a single attempt per workspace.
+model InstagramConnection {
+  workspaceId     String   @id
+  userId          String
+  stateHash       String   @unique
+  existingIdsJson String
+  expiresAt       DateTime
+}
+
+/// Integration credentials a super admin enters in the Control Center (Stripe, social logins, email).
+/// Values are encrypted with ENCRYPTION_MASTER_KEY and override the same-named environment variables.
+model PlatformSetting {
+  key            String   @id
+  encryptedValue String
+  updatedById    String?
+  updatedAt      DateTime @updatedAt
+}
+
+model DirectSocialConnection {
+  stateHash   String   @id
+  workspaceId String
+  userId      String
+  provider    String
+  verifier    String
+  choices     String?
+  expiresAt   DateTime
+
+  @@index([workspaceId, userId])
+}
+
+/// One analysis of a public recording, shared by every workspace that tracks it. Holds no workspace
+/// data: rules, clips and billing stay per workspace. The row is also the lock that stops two workers
+/// from analyzing the same recording at once.
+model RecordingAnalysis {
+  id              String    @id @default(uuid())
+  platform        String
+  externalVideoId String
+  spokenLanguage  String    @default("auto")
+  status          String    @default("RUNNING") // RUNNING, READY, PENDING (not ready yet), FAILED
+  leaseUntil      DateTime?
+  manifestKey     String?
+  durationSec     Float     @default(0)
+  costJson        String    @default("{}")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([platform, externalVideoId, spokenLanguage])
 }

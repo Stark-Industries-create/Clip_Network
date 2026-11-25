@@ -99,7 +99,7 @@ export default function CampaignsPage() {
             </label>
             <label className="flex items-center gap-2">
               <Switch checked={hasAddedLogos} onCheckedChange={setHasAddedLogos} />
-              <span>Simulate Added Watermark</span>
+              <span>Clip has an added watermark</span>
             </label>
           </div>
           <Button type="submit" disabled={busy}>

@@ -56,6 +56,10 @@ export function AppShell({
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   useEffect(() => {
+    document.title = `${title} · Clip Network`;
+  }, [title]);
+
+  useEffect(() => {
     if (booting) return;
     if (!user || !workspace) {
       router.replace('/login');
@@ -92,7 +96,7 @@ export function AppShell({
       label: 'Operations',
       items: [
         { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
-        { href: '/clips/new', label: 'Ingest Clips', icon: Plus },
+        { href: '/clips/new', label: 'Ingest', icon: Plus },
         { href: '/clips', label: 'Clip Library', icon: Film },
         { href: '/approvals', label: 'Approval Queue', icon: CheckSquare },
         { href: '/publishing', label: 'Publishing', icon: Send },
@@ -133,6 +137,7 @@ export function AppShell({
               { href: '/admin', label: 'Control Center', icon: ShieldAlert },
               { href: '/admin/users', label: 'Users', icon: Users },
               { href: '/admin/workspaces', label: 'Workspaces', icon: LayoutDashboard },
+              { href: '/admin/integrations', label: 'Integrations', icon: KeyRound },
               { href: '/admin/subscriptions', label: 'Revenue & Plans', icon: CreditCard },
               { href: '/admin/operations', label: 'Jobs & Ops', icon: Activity },
               { href: '/admin/security', label: 'Security & Audit', icon: ShieldCheck },
@@ -243,6 +248,8 @@ export function AppShell({
 
   return (
     <div className="min-h-screen bg-background text-foreground flex">
+      {/* React 19 hoists this into <head>; it outlives Next's site-wide default title on navigation. */}
+      <title>{`${title} · Clip Network`}</title>
       {/* Desktop Sidebar */}
       <aside className="hidden lg:block w-60 shrink-0 sticky top-0 h-screen">{sidebarContent}</aside>
 
@@ -262,8 +269,9 @@ export function AppShell({
       {/* Main Content Area */}
       <div className="flex-1 min-w-0 flex flex-col">
         <header className="sticky top-0 z-30 border-b border-border bg-background/90 backdrop-blur-md">
-          <div className="flex min-h-16 items-center justify-between gap-4 px-4 sm:px-8 py-3">
-            <div className="flex items-center gap-3 min-w-0">
+          {/* On phones the actions wrap below the title instead of squeezing it to nothing. */}
+          <div className="flex min-h-16 flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 sm:px-8 py-3">
+            <div className="flex items-center gap-3 min-w-0 flex-1 basis-56">
               <Button
                 variant="ghost"
                 size="icon"
@@ -285,7 +293,7 @@ export function AppShell({
                 )}
               </div>
             </div>
-            {actions && <div className="flex items-center gap-2 shrink-0">{actions}</div>}
+            {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
           </div>
         </header>
 

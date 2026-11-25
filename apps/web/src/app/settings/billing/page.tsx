@@ -11,7 +11,7 @@ export default function SettingsBillingPage() {
   return (
     <AppShell
       title="Billing & Subscription"
-      subtitle="Manage your commercial plan, inspect invoices, and upgrade via verified webhooks."
+      subtitle="Choose a plan, pay securely with Stripe and see your invoices."
       breadcrumb="SETTINGS / BILLING"
     >
       {token && workspace && (
@@ -21,6 +21,7 @@ export default function SettingsBillingPage() {
           plans={plans}
           onWorkspaceUpdated={refreshSession}
           onNotify={(m) => notify(m, 'success')}
+          onError={(m) => notify(m, 'error')}
         />
       )}
     </AppShell>

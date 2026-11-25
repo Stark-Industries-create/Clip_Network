@@ -5,39 +5,58 @@ export interface ParsedFeedVideo {
   title: string;
   videoUrl: string;
   publishedAt: Date;
+  streamStatus?: 'LIVE' | 'FINALIZING' | 'REPLAY';
+  thumbnailUrl?: string | null;
 }
 
-/**
- * Parses the latest video entry from a public YouTube Atom XML feed.
- */
+/** Parses usable entries from a public YouTube Atom feed in feed order. */
+export function parseYouTubeAtomVideos(xml: string): ParsedFeedVideo[] {
+  const videos = new Map<string, ParsedFeedVideo>();
+  for (const [, entry = ''] of xml.matchAll(/<entry\b[^>]*>([\s\S]*?)<\/entry>/gi)) {
+    const videoId = entry.match(/<yt:videoId>([\w-]{11})<\/yt:videoId>/i)?.[1];
+    const title = entry.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim();
+    const publication = entry.match(/<published>([^<]+)<\/published>/i)?.[1];
+    const publishedAt = new Date(publication ?? '');
+    if (!videoId || !title || Number.isNaN(publishedAt.getTime()) || videos.has(videoId)) continue;
+    videos.set(videoId, {
+      externalVideoId: videoId,
+      title,
+      videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      publishedAt,
+    });
+  }
+  return [...videos.values()];
+}
+
 export function parseYouTubeAtomLatestVideo(xml: string): ParsedFeedVideo | null {
-  const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/i);
-  if (!entryMatch?.[1]) return null;
-  const entry = entryMatch[1];
-  const videoId = entry.match(/<yt:videoId>([^<]+)<\/yt:videoId>/i)?.[1]?.trim();
-  const title = entry.match(/<title>([^<]+)<\/title>/i)?.[1]?.trim();
-  const published = entry.match(/<published>([^<]+)<\/published>/i)?.[1]?.trim();
-  if (!videoId || !title) return null;
-  return {
-    externalVideoId: videoId,
-    title,
-    videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
-    publishedAt: published ? new Date(published) : new Date(),
-  };
+  return parseYouTubeAtomVideos(xml)[0] ?? null;
 }
 
-export async function tryFetchYouTubeChannelLatest(channelUrl: string): Promise<ParsedFeedVideo | null> {
-  const match = channelUrl.match(/youtube\.com\/channel\/(UC[a-zA-Z0-9_-]+)/i);
-  if (!match?.[1]) return null;
-  const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${match[1]}`;
+/** Returns null when the channel URL is unsupported or the feed could not be read. */
+export async function tryFetchYouTubeChannelVideos(channelUrl: string): Promise<ParsedFeedVideo[] | null> {
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(feedUrl, { signal: controller.signal });
-    clearTimeout(timer);
+    const url = new URL(channelUrl);
+    if (!['youtube.com', 'www.youtube.com', 'm.youtube.com'].includes(url.hostname)) return null;
+    let channelId = url.pathname.match(/^\/channel\/(UC[\w-]+)\/?$/)?.[1];
+    if (!channelId) {
+      const handle = url.pathname.match(/^\/(@[^/]+)(?:\/(?:streams|videos))?\/?$/)?.[1];
+      if (!handle) return null;
+      const page = await fetch(new URL(`/${handle}`, 'https://www.youtube.com'), {
+        signal: AbortSignal.timeout(8_000), redirect: 'error',
+      });
+      if (!page.ok) return null;
+      const html = await page.text();
+      channelId = html.match(/<meta\s+itemprop="channelId"\s+content="(UC[\w-]{22})"/i)?.[1] ??
+        html.match(/"externalId"\s*:\s*"(UC[\w-]{22})"/)?.[1];
+    }
+    if (!channelId) return null;
+    const feedUrl = new URL('https://www.youtube.com/feeds/videos.xml');
+    feedUrl.searchParams.set('channel_id', channelId);
+    const res = await fetch(feedUrl, { signal: AbortSignal.timeout(5_000), redirect: 'error' });
     if (!res.ok) return null;
     const xml = await res.text();
-    return parseYouTubeAtomLatestVideo(xml);
+    if (!/<feed\b[^>]*>/i.test(xml) || !/<\/feed>\s*$/i.test(xml)) return null;
+    return parseYouTubeAtomVideos(xml);
   } catch {
     return null;
   }
@@ -50,30 +69,60 @@ export async function tryFetchYouTubeChannelLatest(channelUrl: string): Promise<
 export function startBackgroundMonitorScheduler(
   prisma: PrismaClient,
   onTickWorkspace: (workspaceId: string) => Promise<void>,
-): () => void {
-  if (process.env['NODE_ENV'] === 'test') return () => {};
+  syncConnector?: () => Promise<void>,
+  onSuccessfulTick?: () => Promise<void>,
+): () => Promise<void> {
+  if (process.env['NODE_ENV'] === 'test') return async () => {};
   const intervalMs = Number(process.env['CHANNEL_MONITOR_INTERVAL_MS'] ?? 300_000);
-  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return () => {};
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return async () => {};
 
-  let running = false;
-  const timer = setInterval(async () => {
-    if (running) return;
-    running = true;
+  let activeTick: Promise<void> | undefined;
+  let stopping = false;
+  const tick = async () => {
+    let successful = true;
     try {
+      if (syncConnector) {
+        try {
+          await syncConnector();
+        } catch (error) {
+          successful = false;
+          console.error('Source connector sync failed', error instanceof Error ? error.name : 'UnknownError');
+        }
+      }
       const workspaces = await prisma.workspace.findMany({
-        where: { creators: { some: { autoMonitorEnabled: true } } },
+        where: { OR: [{ creators: { some: { autoMonitorEnabled: true } } }, { publishPosts: { some: { status: 'SUBMITTED' } } }] },
         select: { id: true },
       });
-      for (const ws of workspaces) {
-        await onTickWorkspace(ws.id);
-      }
-    } catch {
-      // Never crash API process on background poll transient error
-    } finally {
-      running = false;
+      // Listing channels is network-bound, so a few workspaces are scanned at once.
+      const width = Math.min(16, Math.max(1, Number(process.env['DISCOVERY_CONCURRENCY'] ?? 4) || 4));
+      const queue = [...workspaces];
+      await Promise.all(Array.from({ length: Math.min(width, queue.length) }, async () => {
+        for (let ws = queue.shift(); ws && !stopping; ws = queue.shift()) {
+          try {
+            await onTickWorkspace(ws.id);
+          } catch (error) {
+            successful = false;
+            console.error('Workspace monitor failed', ws.id, error instanceof Error ? error.name : 'UnknownError');
+          }
+        }
+      }));
+      if (stopping) return;
+      if (successful && !stopping) await onSuccessfulTick?.();
+    } catch (error) {
+      console.error('Channel monitor tick failed', error instanceof Error ? error.name : 'UnknownError');
     }
-  }, Math.max(30_000, intervalMs));
+  };
+  const launch = () => {
+    if (!stopping && !activeTick) {
+      activeTick = tick().finally(() => { activeTick = undefined; });
+    }
+  };
+  const timer = setInterval(launch, Math.max(30_000, intervalMs));
+  if (syncConnector || onSuccessfulTick) launch();
 
-  timer.unref();
-  return () => clearInterval(timer);
+  return async () => {
+    stopping = true;
+    clearInterval(timer);
+    await activeTick;
+  };
 }

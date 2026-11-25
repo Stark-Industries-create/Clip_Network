@@ -187,6 +187,7 @@ export default function TeamSettingsPage() {
                   type="email"
                   required
                   placeholder="editor@agency.com"
+                  aria-label="Teammate email"
                   value={inviteEmail}
                   onChange={(e) => setInviteEmail(e.target.value)}
                 />

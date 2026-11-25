@@ -7,6 +7,7 @@ import { Badge } from '@/components/ui/badge';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuth } from '@/components/providers/AuthProvider';
 import { apiRequest, type PublishPost } from '@/lib/saas-types';
+import { humanize } from '@/lib/humanize';
 
 interface ExtendedPublishPost extends PublishPost {
   idempotencyKey?: string;
@@ -15,35 +16,45 @@ interface ExtendedPublishPost extends PublishPost {
 export default function PublishingQueuePage() {
   const { token, notify } = useAuth();
   const [posts, setPosts] = useState<ExtendedPublishPost[]>([]);
+  const [loadState, setLoadState] = useState<'loading' | 'ready' | 'error'>('loading');
 
   const load = useCallback(async () => {
     if (!token) return;
     const res = await apiRequest<ExtendedPublishPost[]>('/api/v1/publish-queue', { token });
     if (res.ok && res.json.data) setPosts(res.json.data);
+    setLoadState(res.ok && res.json.data ? 'ready' : 'error');
   }, [token]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  async function publishNow(id: string) {
+  async function publishNow(id: string, sendTikTokDraft = false) {
     if (!token) return;
-    const res = await apiRequest(`/api/v1/publish-queue/${id}/publish`, { method: 'POST', token });
+    const res = await apiRequest<PublishPost>(`/api/v1/publish-queue/${id}/publish`, { method: 'POST', token, body: { sendTikTokDraft } });
     if (res.ok) {
       await load();
-      notify('Publish action executed idempotently.', 'success');
+      notify(res.json.data?.status === 'SUBMITTED' ? (sendTikTokDraft ? 'Draft submitted. Finish the post in your TikTok inbox.' : 'Submitted. Waiting for destination confirmation.') : 'Publish action completed.', 'success');
     } else {
-      notify('Publish attempt failed.', 'error');
+      notify(typeof res.json.error === 'string' ? res.json.error : 'Publish attempt failed. Retry from the queue.', 'error');
     }
   }
 
   return (
     <AppShell
       title="Publishing Queue"
-      subtitle="Idempotent delivery tracking with safe retries and transparent SANDBOX_SIMULATED vs LIVE_OAUTH status."
+      subtitle="Every post to your connected accounts, with its status and safe retries."
       breadcrumb="OPERATIONS / PUBLISHING"
     >
-      {posts.length === 0 ? (
+      {loadState === 'error' && (
+        <div role="alert" className="mb-4 flex items-center gap-3 text-sm">
+          <span>Could not load the publishing queue.</span>
+          <Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>
+        </div>
+      )}
+      {posts.length === 0 ? loadState === 'loading' ? (
+        <p role="status" className="text-sm text-muted-foreground">Loading publishing queue…</p>
+      ) : loadState === 'ready' && (
         <div className="rounded-lg border border-dashed border-border p-12 text-center text-xs text-muted-foreground">
           No posts queued yet. Route a creator to a social account and ingest a compliant clip.
         </div>
@@ -73,7 +84,7 @@ export default function PublishingQueuePage() {
                     <div>{p.socialAccount?.accountHandle}</div>
                     <div className="font-mono text-[10px] text-muted-foreground">{p.platform}</div>
                   </td>
-                  <td className="p-3.5 font-mono text-[11px]">{p.executionMode}</td>
+                  <td className="p-3.5 text-[11px]">{humanize(p.executionMode)}</td>
                   <td className="p-3.5">
                     <Badge
                       variant={
@@ -84,7 +95,7 @@ export default function PublishingQueuePage() {
                             : 'outline'
                       }
                     >
-                      {p.status}
+                      {humanize(p.status)}
                     </Badge>
                   </td>
                   <td className="p-3.5 font-mono text-[10px] text-muted-foreground">
@@ -93,12 +104,12 @@ export default function PublishingQueuePage() {
                   </td>
                   <td className="p-3.5 text-right">
                     {p.status === 'AWAITING_APPROVAL' && (
-                      <Button size="sm" onClick={() => publishNow(p.id)}>
-                        <Send className="mr-1.5 h-3 w-3" /> Publish
+                      <Button size="sm" onClick={() => publishNow(p.id, p.platform === 'TIKTOK' && p.executionMode === 'LIVE_OAUTH')}>
+                        <Send className="mr-1.5 h-3 w-3" /> {p.platform === 'TIKTOK' && p.executionMode === 'LIVE_OAUTH' ? 'Send to TikTok inbox' : 'Publish'}
                       </Button>
                     )}
                     {p.status === 'FAILED' && (
-                      <Button size="sm" variant="outline" onClick={() => publishNow(p.id)}>
+                      <Button size="sm" variant="outline" onClick={() => publishNow(p.id, p.platform === 'TIKTOK' && p.executionMode === 'LIVE_OAUTH')}>
                         <RotateCcw className="mr-1.5 h-3 w-3" /> Safe Retry
                       </Button>
                     )}

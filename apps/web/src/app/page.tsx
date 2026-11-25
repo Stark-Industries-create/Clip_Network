@@ -66,7 +66,7 @@ const FAQS = [
   },
   {
     q: 'Does automatic publishing require connected social accounts?',
-    a: 'Yes. Auto-publishing is strictly opt-in per linked social account and only triggers when a clip passes the creator compliance score threshold. Without a configured live publishing provider key, accounts run transparently in SANDBOX_SIMULATED mode.',
+    a: 'Yes. Auto-publishing is strictly opt-in per linked social account and only triggers when a clip passes the creator compliance score threshold. You connect each account by signing in on the platform itself, and you can revoke access at any time.',
   },
   {
     q: 'How does compliance scoring work?',
@@ -258,7 +258,7 @@ export default function LandingPage() {
               </div>
               <div className="md:pl-8 space-y-2.5">
                 <div className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
-                  Publishing Destinations (OAuth Vault / Sandbox Mode)
+                  Publishing destinations
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {['Instagram Reels', 'TikTok', 'YouTube Shorts', 'X'].map((p) => (

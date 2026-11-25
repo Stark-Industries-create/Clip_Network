@@ -18,7 +18,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuth } from '@/components/providers/AuthProvider';
-import { apiRequest } from '@/lib/saas-types';
+import { apiRequest, describeChannelScan, type ChannelScanResult } from '@/lib/saas-types';
 
 interface AnalyticsPayload {
   scope: string;
@@ -65,6 +65,7 @@ interface AnalyticsPayload {
     watchTimeAvgSec: number;
     completionRatePct: number;
     sourceMode: string;
+    metricsError?: string | null;
   }>;
   insights: Array<{ title: string; detail: string; category: string }>;
 }
@@ -73,16 +74,25 @@ export default function AnalyticsPage() {
   const { token, notify } = useAuth();
   const [data, setData] = useState<AnalyticsPayload | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   const load = useCallback(async () => {
     if (!token) return;
     const res = await apiRequest<AnalyticsPayload>('/api/v1/analytics', { token });
     if (res.ok && res.json.data) setData(res.json.data);
+    setLoadFailed(!res.ok || !res.json.data);
   }, [token]);
 
+  // Opening the page shows stored numbers at once, then refreshes posts not checked in the last six
+  // hours (the server reuses anything newer) and reloads.
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (!token) return;
+    let active = true;
+    void load().then(() => apiRequest('/api/v1/analytics/sync-metrics', { method: 'POST', token }))
+      .then((res) => { if (active && res.ok) return load(); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [load, token]);
 
   async function syncMetrics() {
     if (!token) return;
@@ -95,21 +105,25 @@ export default function AnalyticsPage() {
     if (res.ok && res.json.data) {
       await load();
       notify(`Synced metrics for ${res.json.data.syncedCount} published post(s).`, 'success');
+    } else {
+      notify(typeof res.json.error === 'string' ? res.json.error : 'Could not sync metrics. Retry.', 'error');
     }
   }
 
   async function scanChannels() {
     if (!token) return;
     setBusy(true);
-    const res = await apiRequest('/api/v1/monitor/scan', {
+    const res = await apiRequest<ChannelScanResult>('/api/v1/monitor/scan', {
       method: 'POST',
       token,
-      body: { autoExecute: true },
+      body: {},
     });
     setBusy(false);
-    if (res.ok) {
+    if (res.ok && res.json.data) {
       await load();
-      notify('Channel scan executed and insights refreshed.', 'success');
+      notify(describeChannelScan(res.json.data), res.json.data.creatorsScanned ? 'success' : 'error');
+    } else {
+      notify(typeof res.json.error === 'string' ? res.json.error : 'Could not scan channels. Retry.', 'error');
     }
   }
 
@@ -129,8 +143,14 @@ export default function AnalyticsPage() {
         </div>
       }
     >
-      {!data ? (
-        <p className="text-xs text-muted-foreground">Loading Recharts telemetry...</p>
+      {loadFailed && (
+        <div role="alert" className="mb-4 flex items-center gap-3 text-sm">
+          <span>Could not load analytics.</span>
+          <Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>
+        </div>
+      )}
+      {!data ? !loadFailed && (
+        <p role="status" className="text-xs text-muted-foreground">Loading analytics…</p>
       ) : (
         <div className="space-y-6">
           <div className="rounded-md border border-border bg-card px-4 py-3 text-xs text-muted-foreground flex flex-wrap items-center justify-between gap-2">
@@ -278,7 +298,12 @@ export default function AnalyticsPage() {
                         <td className="p-3.5 font-mono">{p.shares.toLocaleString()}</td>
                         <td className="p-3.5 font-mono">{p.completionRatePct}%</td>
                         <td className="p-3.5">
-                          <Badge variant="outline" className="font-mono text-[10px]">{p.sourceMode}</Badge>
+                          <Badge variant="outline" className="font-mono text-[10px]" title={p.metricsError ?? undefined}>
+                            {p.sourceMode === 'LIVE_PLATFORM_API' ? 'Platform data'
+                              : p.sourceMode === 'SANDBOX_SIMULATED' ? 'Simulated (sandbox)'
+                                : 'Awaiting platform data'}
+                          </Badge>
+                          {p.metricsError && <span className="mt-1 block text-[11px] text-muted-foreground">{p.metricsError}</span>}
                         </td>
                       </tr>
                     ))}

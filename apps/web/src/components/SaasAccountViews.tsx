@@ -27,6 +27,7 @@ import {
   type SaasWorkspace,
   type SupportTicketItem,
 } from '@/lib/saas-types';
+import { humanize } from '@/lib/humanize';
 
 interface BillingViewProps {
   token: string;
@@ -34,6 +35,7 @@ interface BillingViewProps {
   plans: PlanDef[];
   onWorkspaceUpdated: () => Promise<void>;
   onNotify: (msg: string) => void;
+  onError: (msg: string) => void;
 }
 
 export function BillingView({
@@ -42,14 +44,10 @@ export function BillingView({
   plans,
   onWorkspaceUpdated,
   onNotify,
+  onError,
 }: BillingViewProps) {
   const [invoices, setInvoices] = useState<InvoiceItem[]>([]);
   const [busy, setBusy] = useState(false);
-  const [pendingWebhook, setPendingWebhook] = useState<{
-    planName: string;
-    payload: Record<string, unknown>;
-    signature: string;
-  } | null>(null);
 
   const loadBilling = useCallback(async () => {
     const res = await apiRequest<{ invoices: InvoiceItem[] }>('/api/v1/billing/subscription', {
@@ -64,35 +62,42 @@ export function BillingView({
     void loadBilling();
   }, [loadBilling]);
 
+  // Stripe Checkout returns here with ?checkout=success or ?checkout=cancelled.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const outcome = url.searchParams.get('checkout');
+    if (!outcome) return;
+    url.searchParams.delete('checkout');
+    window.history.replaceState(null, '', url);
+    if (outcome === 'success') {
+      onNotify('Payment received. Your plan updates as soon as Stripe confirms it.');
+      // The webhook can land a moment after the redirect; refresh twice to pick it up.
+      void onWorkspaceUpdated().then(loadBilling);
+      const timer = window.setTimeout(() => void onWorkspaceUpdated().then(loadBilling), 4000);
+      return () => window.clearTimeout(timer);
+    }
+    onError('Checkout was cancelled. You have not been charged.');
+  }, [loadBilling, onError, onNotify, onWorkspaceUpdated]);
+
   async function initiateCheckout(planId: PlanDef['id']) {
     setBusy(true);
-    const res = await apiRequest<{
-      billingMode: string;
-      plan: PlanDef;
-      message: string;
-      checkoutUrl?: string;
-      sandboxWebhookPayload?: Record<string, unknown>;
-      sandboxWebhookSignature?: string;
-    }>('/api/v1/billing/checkout', {
-      method: 'POST',
-      token,
-      body: { planTier: planId },
-    });
-    setBusy(false);
-    if (res.ok && res.json.data) {
-      if (res.json.data.checkoutUrl) {
+    try {
+      const res = await apiRequest<{ checkoutUrl?: string; message?: string }>('/api/v1/billing/checkout', {
+        method: 'POST',
+        token,
+        body: { planTier: planId },
+      });
+      if (res.ok && res.json.data?.checkoutUrl) {
         window.location.href = res.json.data.checkoutUrl;
         return;
       }
-      onNotify(res.json.data.message);
-      if (res.json.data.sandboxWebhookPayload && res.json.data.sandboxWebhookSignature) {
-        setPendingWebhook({
-          planName: res.json.data.plan.name,
-          payload: res.json.data.sandboxWebhookPayload,
-          signature: res.json.data.sandboxWebhookSignature,
-        });
-      }
+      onError(typeof res.json.error === 'string' && res.ok === false
+        ? res.json.error
+        : 'Payments are not set up yet. The platform admin adds Stripe in Control Center, Integrations.');
+    } catch {
+      onError('Could not reach billing. Try again.');
     }
+    setBusy(false);
   }
 
   async function openBillingPortal() {
@@ -101,40 +106,24 @@ export function BillingView({
       method: 'POST',
       token,
     });
-    setBusy(false);
     if (res.ok && res.json.data?.portalUrl) {
       window.location.href = res.json.data.portalUrl;
-    } else {
-      onNotify('Stripe Billing Portal activates automatically once STRIPE_LIVE is configured.');
+      return;
     }
-  }
-
-  async function confirmSandboxWebhook() {
-    if (!pendingWebhook) return;
-    setBusy(true);
-    const res = await apiRequest('/api/v1/billing/webhook', {
-      method: 'POST',
-      body: pendingWebhook.payload,
-      extraHeaders: { 'x-billing-signature': pendingWebhook.signature },
-    });
     setBusy(false);
-    if (res.ok) {
-      setPendingWebhook(null);
-      await onWorkspaceUpdated();
-      await loadBilling();
-      onNotify(`Subscription upgraded to ${pendingWebhook.planName} via HMAC-verified webhook.`);
-    } else {
-      onNotify('Webhook verification failed.');
-    }
+    onError(typeof res.json.error === 'string' ? res.json.error : 'Could not open the billing portal.');
   }
 
   async function cancelSubscription() {
+    if (!window.confirm('Cancel your subscription? The workspace returns to the Free plan.')) return;
     setBusy(true);
     const res = await apiRequest('/api/v1/billing/cancel', { method: 'POST', token });
     setBusy(false);
     if (res.ok) {
       await onWorkspaceUpdated();
       onNotify('Subscription cancelled. Workspace reverted to Free tier.');
+    } else {
+      onError(typeof res.json.error === 'string' ? res.json.error : 'Could not cancel the subscription.');
     }
   }
 
@@ -152,13 +141,12 @@ export function BillingView({
               <CreditCard className="h-4 w-4 text-primary" /> Current Subscription &amp; Usage
             </CardTitle>
             <CardDescription>
-              Billing mode: <span className="font-mono">{workspace.billingProviderMode}</span> •
-              Status: <span className="font-semibold">{workspace.subscriptionStatus}</span>
+              Status: <span className="font-semibold">{humanize(workspace.subscriptionStatus)}</span>
             </CardDescription>
           </div>
           <div className="flex items-center gap-2">
-            <Badge>{workspace.planTier} PLAN</Badge>
-            {workspace.billingProviderMode === 'STRIPE_LIVE' && (
+            <Badge>{humanize(workspace.planTier)} plan</Badge>
+            {workspace.stripeCustomerId && (
               <Button variant="outline" size="sm" onClick={openBillingPortal} disabled={busy}>
                 Billing Portal
               </Button>
@@ -182,25 +170,6 @@ export function BillingView({
           </div>
         </CardContent>
       </Card>
-
-      {pendingWebhook && (
-        <Card className="border-primary/60 bg-primary/5">
-          <CardContent className="flex flex-wrap items-center justify-between gap-4 py-4">
-            <div className="space-y-1">
-              <div className="text-sm font-semibold">
-                Sandbox Checkout Ready — {pendingWebhook.planName}
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Frontend never mutates billing directly. Click below to dispatch an HMAC-SHA256
-                signed webhook to <code className="font-mono">/api/v1/billing/webhook</code>.
-              </p>
-            </div>
-            <Button onClick={confirmSandboxWebhook} disabled={busy}>
-              Simulate Verified Payment Webhook
-            </Button>
-          </CardContent>
-        </Card>
-      )}
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         {plans.map((p) => {
@@ -263,12 +232,12 @@ export function BillingView({
                   className="flex items-center justify-between rounded-lg border border-border/60 px-3 py-2 text-xs"
                 >
                   <div>
-                    <span className="font-semibold">{inv.planTier}</span>
-                    <span className="ml-2 font-mono text-muted-foreground">{inv.externalEventId}</span>
+                    <span className="font-semibold">{humanize(inv.planTier)}</span>
+                    <span className="ml-2 text-muted-foreground">{new Date(inv.createdAt).toLocaleDateString()}</span>
                   </div>
                   <div className="flex items-center gap-3">
                     <span className="font-mono">${(inv.amountCents / 100).toFixed(2)} {inv.currency}</span>
-                    <Badge variant={inv.status === 'PAID' ? 'default' : 'destructive'}>{inv.status}</Badge>
+                    <Badge variant={inv.status === 'PAID' ? 'default' : 'destructive'}>{humanize(inv.status)}</Badge>
                   </div>
                 </div>
               ))}

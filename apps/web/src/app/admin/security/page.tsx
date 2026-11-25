@@ -132,6 +132,7 @@ export default function AdminSecurityPage() {
             </h2>
             <Input
               placeholder="Filter by action (e.g. USER_REGISTERED)..."
+              aria-label="Filter audit log by action"
               value={auditFilter}
               onChange={(e) => setAuditFilter(e.target.value)}
               className="max-w-xs h-8 text-xs"

@@ -9,7 +9,7 @@ import { apiRequest } from '@/lib/saas-types';
 
 export default function SettingsUsagePage() {
   const { token, workspace, plans } = useAuth();
-  const [counts, setCounts] = useState({ creators: 0, accounts: 0, keys: 0 });
+  const [counts, setCounts] = useState({ creators: 0, accounts: 0, keys: 0, analysisHours: 0, analysisLimit: 0 });
 
   useEffect(() => {
     if (!token) return;
@@ -17,11 +17,14 @@ export default function SettingsUsagePage() {
       apiRequest<unknown[]>('/api/v1/creators', { token }),
       apiRequest<unknown[]>('/api/v1/social-accounts', { token }),
       apiRequest<Array<{ revokedAt?: string | null }>>('/api/v1/api-keys', { token }),
-    ]).then(([c, a, k]) => {
+      apiRequest<{ analysisHoursUsed: number; monthlyAnalysisHours: number }>('/api/v1/workspace/automation', { token }),
+    ]).then(([c, a, k, auto]) => {
       setCounts({
         creators: c.json.data?.length ?? 0,
         accounts: a.json.data?.length ?? 0,
         keys: (k.json.data ?? []).filter((x) => !x.revokedAt).length,
+        analysisHours: auto.json.data?.analysisHoursUsed ?? 0,
+        analysisLimit: auto.json.data?.monthlyAnalysisHours ?? 0,
       });
     });
   }, [token]);
@@ -32,6 +35,11 @@ export default function SettingsUsagePage() {
       label: 'Monthly Clips',
       used: workspace?.clipsUsedThisPeriod ?? 0,
       limit: workspace?.monthlyClipLimit ?? 10,
+    },
+    {
+      label: 'Recording Analysis (hours)',
+      used: counts.analysisHours,
+      limit: counts.analysisLimit || 1,
     },
     {
       label: 'Tagged Creators',

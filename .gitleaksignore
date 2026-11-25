@@ -1,0 +1,6 @@
+# Reviewed false positives: curl examples with placeholder keys, and the public development
+# encryption key that .env.example used to ship. None are real credentials.
+1d57bfaa60c17ab8fe72f169a0d358171ebe9080:apps/web/src/app/docs/page.tsx:curl-auth-header:74
+1d57bfaa60c17ab8fe72f169a0d358171ebe9080:apps/web/src/app/settings/api-keys/page.tsx:curl-auth-header:119
+7ae451fc90b2f631da6d9ce15fc2fc57bd85a2e9:apps/web/src/components/SaasAccountViews.tsx:curl-auth-header:557
+932fe7ff5e901e387151cd79fcd6525c84a80b76:.env.example:generic-api-key:7

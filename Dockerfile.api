@@ -1,5 +1,7 @@
-FROM node:22-alpine AS base
-RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+FROM node:22-bookworm-slim AS base
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl \
+ && rm -rf /var/lib/apt/lists/* \
+ && corepack enable && corepack prepare pnpm@9.15.0 --activate
 WORKDIR /app
 
 FROM base AS deps
@@ -19,15 +21,50 @@ RUN pnpm --filter @clip-network/shared build \
  && pnpm --filter @clip-network/api exec prisma generate --schema=${PRISMA_SCHEMA} \
  && pnpm --filter @clip-network/api exec tsc -p tsconfig.json
 
-FROM node:22-alpine AS runner
-RUN apk add --no-cache ffmpeg openssl && addgroup -S app && adduser -S app -G app
+FROM node:22-bookworm-slim AS runner
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg openssl fonts-dejavu-core fonts-noto-core wget \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system app && useradd --system --gid app app
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=4100
-COPY --from=builder /app ./
-RUN mkdir -p /app/apps/api/data && chown -R app:app /app
+COPY --chown=app:app --from=builder /app ./
+RUN mkdir -p /app/apps/api/data && chown app:app /app/apps/api/data
 USER app
 EXPOSE 4100
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://localhost:4100/api/health || exit 1
 CMD ["node", "apps/api/dist/index.js"]
+
+FROM debian:bookworm-slim AS whisper
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN curl --fail --silent --show-error --location https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/refs/tags/v1.8.3 \
+ | tar -xz --strip-components=1 \
+ && cmake -S . -B out -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF \
+ && cmake --build out --config Release --target whisper-cli --parallel 2
+
+FROM runner AS inference
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends curl python3 python3-venv \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 -m venv /opt/clip-python \
+ && /opt/clip-python/bin/pip install --no-cache-dir 'yt-dlp[default]==2026.10.26' 'opencv-python-headless==4.14.0.94'
+COPY --from=whisper /build/out/bin/whisper-cli /usr/local/bin/whisper-cli
+RUN mkdir -p /opt/clip-models \
+ && curl -fsSL --retry 3 -o /opt/clip-models/base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin \
+ && curl -fsSL --retry 3 -o /opt/clip-models/yunet.onnx https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx \
+ && curl -fsSL --retry 3 -o /opt/clip-models/vad.bin https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin \
+ && echo '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe  /opt/clip-models/base.bin' | sha256sum -c - \
+ && echo '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4  /opt/clip-models/yunet.onnx' | sha256sum -c - \
+ && echo '29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf  /opt/clip-models/vad.bin' | sha256sum -c -
+ENV YOUTUBE_SOURCE_PYTHON=/opt/clip-python/bin/python
+ENV YOUTUBE_WHISPER_CLI=/usr/local/bin/whisper-cli
+ENV YOUTUBE_WHISPER_VAD_MODEL=/opt/clip-models/vad.bin
+# Multilingual so Nepali and Hindi creators get transcripts; set each creator's spokenLanguage.
+ENV CLIP_FINAL_CAPTION_MODEL=/opt/clip-models/base.bin
+ENV FACECAM_YUNET_MODEL=/opt/clip-models/yunet.onnx
+USER app
+
+FROM runner AS api

@@ -1,207 +1,69 @@
 'use client';
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import { Play, Volume2 } from 'lucide-react';
+import { Plus, Scissors } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Switch } from '@/components/ui/switch';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuth } from '@/components/providers/AuthProvider';
+import { PlatformIcon, ProfilePhoto } from '@/components/ui/profile-photo';
+import { humanize } from '@/lib/humanize';
 import { apiRequest, type Creator } from '@/lib/saas-types';
 
-const CAPTION_PRESETS = ['HIGH_ENERGY', 'BOLD_CREATOR', 'CLEAN_MINIMAL', 'PODCAST_PREMIUM'] as const;
-const LAYOUT_PRESETS = ['SPLIT_FACECAM_BOTTOM', 'CENTER_CROP_9_16'] as const;
+type CreatorRow = Creator & { _count?: { clips: number; channelVideos: number } };
 
-export default function NewClipPage() {
-  const router = useRouter();
-  const { token, workspace, refreshSession, notify } = useAuth();
-  const [creators, setCreators] = useState<Creator[]>([]);
-  const [creatorId, setCreatorId] = useState('');
-  const [sourceUrl, setSourceUrl] = useState('https://www.twitch.tv/videos/2933767012');
-  const [title, setTitle] = useState('Lacy GTA 6 Marathon Hype Moment');
-  const [startSec, setStartSec] = useState(120);
-  const [endSec, setEndSec] = useState(145);
-  const [transcriptText, setTranscriptText] = useState(
-    'We are live on the GTA 6 marathon tonight and chat is going absolutely wild!',
-  );
-  const [captionStyle, setCaptionStyle] = useState<(typeof CAPTION_PRESETS)[number]>('HIGH_ENERGY');
-  const [layout, setLayout] = useState<(typeof LAYOUT_PRESETS)[number]>('SPLIT_FACECAM_BOTTOM');
-  const [enableSfx, setEnableSfx] = useState(true);
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    if (!token) return;
-    const res = await apiRequest<Creator[]>('/api/v1/creators', { token });
-    if (res.ok && res.json.data) {
-      setCreators(res.json.data);
-      if (res.json.data[0] && !creatorId) setCreatorId(res.json.data[0].id);
-    }
-  }, [token, creatorId]);
+/** Ingest starts from a tagged creator: pick one to browse the recordings detected on their channel. */
+export default function IngestCreatorsPage() {
+  const { token } = useAuth();
+  const [creators, setCreators] = useState<CreatorRow[] | null>(null);
 
   useEffect(() => {
-    void load();
-  }, [load]);
-
-  const selectedCreator = creators.find((c) => c.id === creatorId);
-
-  async function handleGenerate(e: React.FormEvent) {
-    e.preventDefault();
-    if (!token || !creatorId) {
-      notify('Select or add a creator first.', 'error');
-      return;
-    }
-    setBusy(true);
-    const res = await apiRequest<{ clip: { id: string } }>('/api/v1/clips/ingest', {
-      method: 'POST',
-      token,
-      body: {
-        creatorId,
-        sourceUrl,
-        title,
-        startSec,
-        endSec,
-        transcriptText,
-        captionStyle,
-        layout,
-        enableSfx,
-      },
-    });
-    setBusy(false);
-    if (res.ok && res.json.data) {
-      await refreshSession();
-      notify('Clip generated and scored. Opening Review Studio...', 'success');
-      router.push(`/clips/${res.json.data.clip.id}`);
-    } else if (res.status === 402) {
-      notify('Monthly clip quota exhausted. Upgrade your plan in Billing.', 'error');
-      router.push('/settings/billing');
-    } else {
-      notify(typeof res.json.error === 'string' ? res.json.error : 'Ingest failed.', 'error');
-    }
-  }
+    if (!token) return;
+    void apiRequest<CreatorRow[]>('/api/v1/creators', { token }).then((res) => setCreators(res.ok && res.json.data ? res.json.data : []));
+  }, [token]);
 
   return (
     <AppShell
-      title="Ingest Stream Clip"
-      subtitle="Run speech-aligned captions, procedural SFX, compliance scoring, and routing."
-      breadcrumb="OPERATIONS / INGEST CLIPS"
+      title="Ingest"
+      subtitle="Pick a tagged creator to see every recording found on their channel."
+      breadcrumb="OPERATIONS / INGEST"
+      actions={
+        <Button size="sm" variant="outline" asChild>
+          <Link href="/clips/new/manual"><Scissors className="mr-1.5 h-3.5 w-3.5" /> Cut a clip by hand</Link>
+        </Button>
+      }
     >
-      <div className="grid gap-6 lg:grid-cols-12">
-        <form
-          onSubmit={handleGenerate}
-          className="lg:col-span-8 rounded-lg border border-border bg-card p-6 space-y-4"
-        >
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label>Source Creator</Label>
-              <select
-                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                value={creatorId}
-                onChange={(e) => setCreatorId(e.target.value)}
-              >
-                {creators.length === 0 && <option value="">No creators tagged yet</option>}
-                {creators.map((c) => (
-                  <option key={c.id} value={c.id}>{c.displayName} (@{c.handle} • {c.platform})</option>
-                ))}
-              </select>
-            </div>
-            <div className="space-y-1">
-              <Label>Stream / VOD URL</Label>
-              <Input required value={sourceUrl} onChange={(e) => setSourceUrl(e.target.value)} />
-            </div>
-          </div>
-
-          <div className="space-y-1">
-            <Label>Clip Hook / Title</Label>
-            <Input required value={title} onChange={(e) => setTitle(e.target.value)} />
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label>Start Time (sec)</Label>
-              <Input type="number" min={0} value={startSec} onChange={(e) => setStartSec(Number(e.target.value))} />
-            </div>
-            <div className="space-y-1">
-              <Label>End Time (sec)</Label>
-              <Input type="number" min={1} value={endSec} onChange={(e) => setEndSec(Number(e.target.value))} />
-            </div>
-          </div>
-
-          <div className="space-y-1">
-            <Label>Transcript Excerpt (Speech Alignment &amp; Compliance Check)</Label>
-            <textarea
-              required
-              rows={3}
-              value={transcriptText}
-              onChange={(e) => setTranscriptText(e.target.value)}
-              className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-            />
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label>Caption Style Preset</Label>
-              <select
-                className="h-10 w-full rounded-md border border-input bg-background px-3 text-xs font-mono"
-                value={captionStyle}
-                onChange={(e) => setCaptionStyle(e.target.value as (typeof CAPTION_PRESETS)[number])}
-              >
-                {CAPTION_PRESETS.map((p) => <option key={p} value={p}>{p}</option>)}
-              </select>
-            </div>
-            <div className="space-y-1">
-              <Label>Vertical Framing Layout</Label>
-              <select
-                className="h-10 w-full rounded-md border border-input bg-background px-3 text-xs font-mono"
-                value={layout}
-                onChange={(e) => setLayout(e.target.value as (typeof LAYOUT_PRESETS)[number])}
-              >
-                {LAYOUT_PRESETS.map((l) => <option key={l} value={l}>{l}</option>)}
-              </select>
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between border-t border-border pt-4">
-            <label className="flex items-center gap-2 text-xs">
-              <Switch checked={enableSfx} onCheckedChange={setEnableSfx} />
-              <Volume2 className="h-3.5 w-3.5 text-primary" />
-              <span>Procedural SFX Cues (WHOOSH / POP / BOOM)</span>
-            </label>
-            <Button type="submit" disabled={busy || !creatorId}>
-              <Play className="mr-1.5 h-3.5 w-3.5" />
-              {busy ? 'Generating...' : 'Generate Clips'}
-            </Button>
-          </div>
-        </form>
-
-        {/* Pre-Execution Summary & Quota Impact */}
-        <div className="lg:col-span-4 rounded-lg border border-border bg-card p-5 space-y-4 h-fit text-xs">
-          <h2 className="font-display text-sm font-semibold">Pre-Execution Summary</h2>
-          <div className="space-y-2 border-y border-border py-3">
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Creator</span>
-              <span className="font-medium">{selectedCreator ? selectedCreator.displayName : 'None'}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Required Topics</span>
-              <span className="font-mono">{selectedCreator?.requiredTopics.join(', ') || 'Any'}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Quota Impact</span>
-              <span className="font-mono">
-                +1 clip ({(workspace?.clipsUsedThisPeriod ?? 0) + 1}/{workspace?.monthlyClipLimit ?? 10})
-              </span>
-            </div>
-          </div>
-          {creators.length === 0 && (
-            <Button variant="outline" size="sm" className="w-full" asChild>
-              <Link href="/creators">Tag Your First Creator →</Link>
-            </Button>
-          )}
+      {creators === null ? (
+        <p role="status" className="text-xs text-muted-foreground">Loading creators…</p>
+      ) : creators.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border p-12 text-center space-y-3">
+          <p className="text-sm font-medium">No creators tagged yet</p>
+          <p className="text-xs text-muted-foreground">Tag a YouTube, Twitch or Kick channel and its recordings appear here.</p>
+          <Button size="sm" asChild><Link href="/creators"><Plus className="mr-1.5 h-3.5 w-3.5" /> Tag a creator</Link></Button>
         </div>
-      </div>
+      ) : (
+        <ul className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {creators.map((c) => (
+            <li key={c.id}>
+              <Link href={`/clips/new/creator/${c.id}`}
+                className="flex h-full items-center gap-4 rounded-lg border border-border bg-card p-4 transition-colors hover:border-primary/60">
+                <ProfilePhoto src={c.avatarUrl} name={c.displayName} size={56} />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-display text-sm font-semibold">{c.displayName}</div>
+                  <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <PlatformIcon platform={c.platform} /> {humanize(c.platform)} · @{c.handle}
+                  </div>
+                  <div className="mt-2 flex gap-3 text-[11px] text-muted-foreground">
+                    <span><strong className="text-foreground">{c._count?.channelVideos ?? 0}</strong> videos found</span>
+                    <span><strong className="text-foreground">{c._count?.clips ?? 0}</strong> clips</span>
+                  </div>
+                  {c.sourceAccessError && <div className="mt-1 truncate text-[11px] text-destructive">{c.sourceAccessError}</div>}
+                </div>
+              </Link>
+            </li>
+          ))}
+        </ul>
+      )}
     </AppShell>
   );
 }

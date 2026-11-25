@@ -7,9 +7,11 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
+import { PlatformIcon, ProfilePhoto } from '@/components/ui/profile-photo';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuth } from '@/components/providers/AuthProvider';
 import { apiRequest, type Creator } from '@/lib/saas-types';
+import { humanize } from '@/lib/humanize';
 
 export default function CreatorsPage() {
   const { token, notify } = useAuth();
@@ -23,8 +25,9 @@ export default function CreatorsPage() {
   const [displayName, setDisplayName] = useState('');
   const [platform, setPlatform] = useState<'TWITCH' | 'YOUTUBE' | 'KICK'>('TWITCH');
   const [channelUrl, setChannelUrl] = useState('');
-  const [requiredTopics, setRequiredTopics] = useState('GTA, marathon');
-  const [bannedKeywords, setBannedKeywords] = useState('gambling');
+  const [requiredTopics, setRequiredTopics] = useState('');
+  const [bannedKeywords, setBannedKeywords] = useState('');
+  const [spokenLanguage, setSpokenLanguage] = useState('auto');
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -47,12 +50,17 @@ export default function CreatorsPage() {
         handle: handle.trim(),
         displayName: displayName.trim(),
         platform,
-        channelUrl: channelUrl.trim() || `https://www.twitch.tv/${handle.trim()}`,
+        channelUrl: channelUrl.trim() || {
+          TWITCH: `https://www.twitch.tv/${encodeURIComponent(handle.trim().replace(/^@/, ''))}`,
+          YOUTUBE: `https://www.youtube.com/@${encodeURIComponent(handle.trim().replace(/^@/, ''))}/streams`,
+          KICK: `https://kick.com/${encodeURIComponent(handle.trim().replace(/^@/, ''))}`,
+        }[platform],
         tags: [handle.trim()],
         requiredTopics: requiredTopics.split(',').map((s) => s.trim()).filter(Boolean),
         bannedKeywords: bannedKeywords.split(',').map((s) => s.trim()).filter(Boolean),
         disallowLogos: true,
         enableSfx: true,
+        spokenLanguage,
       },
     });
     setBusy(false);
@@ -66,6 +74,17 @@ export default function CreatorsPage() {
     } else {
       notify(typeof res.json.error === 'string' ? res.json.error : 'Could not add creator.', 'error');
     }
+  }
+
+  async function retryChannel(creatorId: string) {
+    if (!token) return;
+    const res = await apiRequest<{ unavailableChannels: string[]; detectedVideos: unknown[] }>('/api/v1/monitor/scan', {
+      method: 'POST', token, body: { creatorId },
+    });
+    await load();
+    if (!res.ok || !res.json.data) notify('Could not check the channel. Retry.', 'error');
+    else if (res.json.data.unavailableChannels.length) notify('The channel could not be read. Open it to fix its URL.', 'error');
+    else notify(`Channel checked: ${res.json.data.detectedVideos.length} new recording(s).`, 'success');
   }
 
   const filtered = creators.filter((c) => {
@@ -118,12 +137,27 @@ export default function CreatorsPage() {
               <Input placeholder="https://www.twitch.tv/lacy" value={channelUrl} onChange={(e) => setChannelUrl(e.target.value)} />
             </div>
             <div className="space-y-1">
-              <Label>Required Topics (comma-separated)</Label>
-              <Input value={requiredTopics} onChange={(e) => setRequiredTopics(e.target.value)} />
+              <Label htmlFor="creator-required-topics">Required Topics (comma-separated)</Label>
+              <Input id="creator-required-topics" value={requiredTopics} onChange={(e) => setRequiredTopics(e.target.value)} />
             </div>
             <div className="space-y-1">
-              <Label>Banned Keywords (comma-separated)</Label>
-              <Input value={bannedKeywords} onChange={(e) => setBannedKeywords(e.target.value)} />
+              <Label htmlFor="creator-banned-keywords">Banned Keywords (comma-separated)</Label>
+              <Input id="creator-banned-keywords" value={bannedKeywords} onChange={(e) => setBannedKeywords(e.target.value)} />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="creator-spoken-language">Spoken language</Label>
+              <select
+                id="creator-spoken-language"
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                value={spokenLanguage}
+                onChange={(e) => setSpokenLanguage(e.target.value)}
+              >
+                <option value="auto">Detect automatically</option>
+                <option value="en">English</option>
+                <option value="ne">Nepali (नेपाली)</option>
+                <option value="hi">Hindi (हिन्दी)</option>
+              </select>
+              <p className="text-xs text-muted-foreground">Setting it avoids misdetection on short or mixed-language clips.</p>
             </div>
             <div className="md:col-span-2 flex justify-end gap-2">
               <Button type="button" variant="outline" onClick={() => setShowAdd(false)}>Cancel</Button>
@@ -138,6 +172,7 @@ export default function CreatorsPage() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
             <Input
               placeholder="Search creators..."
+              aria-label="Search creators"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               className="pl-9 h-9 text-xs"
@@ -177,6 +212,7 @@ export default function CreatorsPage() {
                   <th className="p-3.5">Required Topics</th>
                   <th className="p-3.5">Banned Keywords</th>
                   <th className="p-3.5">Defaults</th>
+                  <th className="p-3.5">Status</th>
                   <th className="p-3.5 text-right">Details</th>
                 </tr>
               </thead>
@@ -184,14 +220,33 @@ export default function CreatorsPage() {
                 {filtered.map((c) => (
                   <tr key={c.id} className="hover:bg-secondary/30">
                     <td className="p-3.5">
-                      <div className="font-medium text-foreground">{c.displayName}</div>
-                      <div className="font-mono text-muted-foreground">@{c.handle}</div>
+                      <div className="flex items-center gap-3">
+                        <ProfilePhoto src={c.avatarUrl} name={c.displayName} size={36} />
+                        <div className="min-w-0">
+                          <div className="font-medium text-foreground">{c.displayName}</div>
+                          <div className="font-mono text-muted-foreground">@{c.handle}</div>
+                        </div>
+                      </div>
                     </td>
-                    <td className="p-3.5"><Badge variant="outline">{c.platform}</Badge></td>
+                    <td className="p-3.5">
+                      <Badge variant="outline" className="gap-1"><PlatformIcon platform={c.platform} />{humanize(c.platform)}</Badge>
+                    </td>
                     <td className="p-3.5 text-muted-foreground">{c.requiredTopics.join(', ') || 'Any'}</td>
                     <td className="p-3.5 text-muted-foreground">{c.bannedKeywords.join(', ') || 'None'}</td>
                     <td className="p-3.5 font-mono text-[11px] text-muted-foreground">
-                      {c.defaultCaptionStyle} • {c.enableSfx ? 'SFX ON' : 'SFX OFF'}
+                      {humanize(c.defaultCaptionStyle)} • {c.enableSfx ? 'SFX ON' : 'SFX OFF'}
+                    </td>
+                    <td className="p-3.5">
+                      {c.sourceAccessError ? (
+                        <div className="flex items-center gap-2">
+                          <span className="text-destructive" title={c.sourceAccessError}>Channel check failed</span>
+                          <Button size="sm" variant="outline" className="h-7" onClick={() => void retryChannel(c.id)}>Retry</Button>
+                        </div>
+                      ) : !c.autoMonitorEnabled ? (
+                        <span className="text-muted-foreground">Paused</span>
+                      ) : (
+                        <span className="text-muted-foreground">{c.lastPolledAt ? 'Monitoring' : 'Waiting for first check'}</span>
+                      )}
                     </td>
                     <td className="p-3.5 text-right">
                       <Button size="sm" variant="ghost" asChild>

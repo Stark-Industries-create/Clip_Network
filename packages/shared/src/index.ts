@@ -5,6 +5,7 @@ export type CreatorPlatform = z.infer<typeof CreatorPlatformSchema>;
 
 export const SocialPlatformSchema = z.enum([
   'INSTAGRAM_REELS',
+  'FACEBOOK_REELS',
   'TIKTOK',
   'YOUTUBE_SHORTS',
   'X',
@@ -25,6 +26,9 @@ export type LayoutMode = z.infer<typeof LayoutModeSchema>;
 export const SfxPresetIdSchema = z.enum(['WHOOSH', 'POP', 'RISER', 'BOOM', 'CHIME', 'GLITCH']);
 export type SfxPresetId = z.infer<typeof SfxPresetIdSchema>;
 
+/** Whisper language code for a creator's speech: `auto`, or ISO 639-1 such as `en`, `ne`, `hi`. */
+export const SpokenLanguageSchema = z.string().regex(/^(auto|[a-z]{2,3})$/);
+
 export const CreateCreatorRequestSchema = z.object({
   handle: z.string().min(2).max(80),
   displayName: z.string().min(2).max(120),
@@ -37,6 +41,7 @@ export const CreateCreatorRequestSchema = z.object({
   defaultLayout: LayoutModeSchema.default('SPLIT_FACECAM_BOTTOM'),
   defaultCaptionStyle: CaptionStyleIdSchema.default('HIGH_ENERGY'),
   enableSfx: z.boolean().default(true),
+  spokenLanguage: SpokenLanguageSchema.default('auto'),
   facecamCrop: z
     .object({
       x: z.number().int().nonnegative().default(0),
@@ -72,6 +77,15 @@ export const CreateRouteRuleRequestSchema = z.object({
   enabled: z.boolean().default(true),
 });
 export type CreateRouteRuleRequest = z.infer<typeof CreateRouteRuleRequestSchema>;
+
+export const RegisterSourceVideoSchema = z.object({
+  recordingStatus: z.enum(['LIVE', 'FINALIZING', 'REPLAY']).optional(),
+  creatorId: z.string().uuid(),
+  externalVideoId: z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/),
+  title: z.string().trim().min(1).max(300),
+  videoUrl: z.string().url().max(2048),
+  publishedAt: z.string().datetime({ offset: true }),
+});
 
 export const IngestStreamRequestSchema = z.object({
   creatorId: z.string().uuid(),
@@ -123,6 +137,12 @@ export interface SaasPlanDefinition {
   tagline: string;
   priceMonthlyUsd: number;
   monthlyClipLimit: number;
+  /** Hours of recordings the worker analyzes per billing period. */
+  monthlyAnalysisHours: number;
+  /** Longest single recording analyzed, in hours. */
+  maxRecordingHours: number;
+  /** Jobs (analysis, render, publish) one workspace may run at the same time. */
+  workerConcurrency: number;
   maxCreators: number;
   maxSocialAccounts: number;
   apiKeysAllowed: number;
@@ -137,6 +157,9 @@ export const SAAS_PLANS: Record<PlanTier, SaasPlanDefinition> = {
     tagline: 'Test the clipping engine on your first channel.',
     priceMonthlyUsd: 0,
     monthlyClipLimit: 10,
+    monthlyAnalysisHours: 5,
+    maxRecordingHours: 2,
+    workerConcurrency: 1,
     maxCreators: 2,
     maxSocialAccounts: 2,
     apiKeysAllowed: 1,
@@ -153,6 +176,9 @@ export const SAAS_PLANS: Record<PlanTier, SaasPlanDefinition> = {
     tagline: 'For solo clippers running multi-platform fan pages.',
     priceMonthlyUsd: 29,
     monthlyClipLimit: 100,
+    monthlyAnalysisHours: 40,
+    maxRecordingHours: 6,
+    workerConcurrency: 1,
     maxCreators: 10,
     maxSocialAccounts: 10,
     apiKeysAllowed: 3,
@@ -169,6 +195,9 @@ export const SAAS_PLANS: Record<PlanTier, SaasPlanDefinition> = {
     tagline: 'High-volume clipping agencies & creator networks.',
     priceMonthlyUsd: 99,
     monthlyClipLimit: 500,
+    monthlyAnalysisHours: 200,
+    maxRecordingHours: 12,
+    workerConcurrency: 2,
     maxCreators: 50,
     maxSocialAccounts: 50,
     apiKeysAllowed: 10,
@@ -186,6 +215,9 @@ export const SAAS_PLANS: Record<PlanTier, SaasPlanDefinition> = {
     tagline: 'Custom scale for media networks & brand campaigns.',
     priceMonthlyUsd: 299,
     monthlyClipLimit: 5000,
+    monthlyAnalysisHours: 2000,
+    maxRecordingHours: 24,
+    workerConcurrency: 4,
     maxCreators: 500,
     maxSocialAccounts: 500,
     apiKeysAllowed: 50,

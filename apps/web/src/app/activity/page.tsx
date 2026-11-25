@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuth } from '@/components/providers/AuthProvider';
 import { apiRequest, type ClipJob } from '@/lib/saas-types';
+import { humanize } from '@/lib/humanize';
 
 export default function ActivityPage() {
   const { token } = useAuth();
@@ -50,10 +51,9 @@ export default function ActivityPage() {
             <table className="w-full text-left text-xs">
               <thead className="border-b border-border font-mono text-muted-foreground">
                 <tr>
-                  <th className="p-3.5">Execution ID</th>
-                  <th className="p-3.5">Clip Title</th>
+                  <th className="p-3.5">Clip</th>
                   <th className="p-3.5">Creator</th>
-                  <th className="p-3.5">Duration</th>
+                  <th className="p-3.5">Length</th>
                   <th className="p-3.5">Status</th>
                   <th className="p-3.5">Compliance</th>
                 </tr>
@@ -61,15 +61,12 @@ export default function ActivityPage() {
               <tbody className="divide-y divide-border">
                 {filtered.map((c) => (
                   <tr key={c.id} className="hover:bg-secondary/30">
-                    <td className="p-3.5 font-mono text-[11px]">
-                      <Link href={`/clips/${c.id}`} className="text-primary hover:underline">
-                        {c.id.slice(0, 8)}…
-                      </Link>
+                    <td className="p-3.5 font-medium">
+                      <Link href={`/clips/${c.id}`} className="text-primary hover:underline">{c.title}</Link>
                     </td>
-                    <td className="p-3.5 font-medium">{c.title}</td>
                     <td className="p-3.5 text-muted-foreground">{c.creator?.displayName ?? '—'}</td>
-                    <td className="p-3.5 font-mono">{c.durationMs}ms</td>
-                    <td className="p-3.5"><Badge variant="outline">{c.executionStatus}</Badge></td>
+                    <td className="p-3.5 font-mono">{Math.round(c.durationSec)}s</td>
+                    <td className="p-3.5"><Badge variant="outline">{humanize(c.executionStatus)}</Badge></td>
                     <td className="p-3.5 font-mono">{c.complianceScore}/100</td>
                   </tr>
                 ))}

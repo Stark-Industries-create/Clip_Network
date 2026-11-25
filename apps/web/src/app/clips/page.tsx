@@ -6,9 +6,11 @@ import { Grid2x2, List, Plus, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
+import { ProfilePhoto, Thumbnail } from '@/components/ui/profile-photo';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuth } from '@/components/providers/AuthProvider';
 import { apiRequest, type ClipJob } from '@/lib/saas-types';
+import { humanize } from '@/lib/humanize';
 
 export default function ClipLibraryPage() {
   const { token } = useAuth();
@@ -54,6 +56,7 @@ export default function ClipLibraryPage() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
             <Input
               placeholder="Search clips or creators..."
+              aria-label="Search clips or creators"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               className="pl-9 h-9 text-xs"
@@ -107,27 +110,26 @@ export default function ClipLibraryPage() {
                 href={`/clips/${c.id}`}
                 className="group rounded-lg border border-border bg-card overflow-hidden hover:border-primary/60 transition-colors flex flex-col justify-between"
               >
-                <div className="aspect-[16/10] bg-background border-b border-border p-4 flex flex-col justify-between">
-                  <div className="flex items-center justify-between text-[10px] font-mono text-muted-foreground">
-                    <span>{c.layout}</span>
-                    <span>{c.durationSec}s</span>
-                  </div>
-                  <div className="text-center font-display text-sm font-semibold px-2 line-clamp-2 group-hover:text-primary transition-colors">
-                    {c.title}
-                  </div>
-                  <div className="flex items-center justify-between text-[10px] font-mono text-muted-foreground">
-                    <span>{c.captionStyle}</span>
-                    <span>{c.enableSfx ? 'SFX ON' : 'SFX OFF'}</span>
-                  </div>
+                <div className="relative aspect-video border-b border-border bg-muted">
+                  <Thumbnail src={c.sourceVideo?.thumbnailUrl} className="h-full w-full rounded-none" />
+                  <span className="absolute bottom-2 right-2 rounded bg-black/75 px-1.5 py-0.5 font-mono text-[10px] text-white">
+                    {Math.round(c.durationSec)}s
+                  </span>
                 </div>
-                <div className="p-4 flex items-center justify-between text-xs">
-                  <span className="text-muted-foreground truncate">{c.creator?.displayName ?? 'Creator'}</span>
+                <div className="px-4 pt-3 font-display text-sm font-semibold line-clamp-2 group-hover:text-primary transition-colors">
+                  {c.title}
+                </div>
+                <div className="p-4 pt-2 flex items-center justify-between gap-2 text-xs">
+                  <span className="flex min-w-0 items-center gap-2 text-muted-foreground">
+                    <ProfilePhoto src={c.creator?.avatarUrl} name={c.creator?.displayName ?? 'Creator'} size={20} />
+                    <span className="truncate">{c.creator?.displayName ?? 'Creator'}</span>
+                  </span>
                   <div className="flex items-center gap-1.5">
                     <Badge variant={c.compliancePassed ? 'secondary' : 'destructive'} className="font-mono text-[10px]">
                       {c.complianceScore}/100
                     </Badge>
                     <Badge variant="outline" className="font-mono text-[10px]">
-                      {c.approvalStatus}
+                      {humanize(c.approvalStatus)}
                     </Badge>
                   </div>
                 </div>
@@ -151,15 +153,16 @@ export default function ClipLibraryPage() {
                 {filtered.map((c) => (
                   <tr key={c.id} className="hover:bg-secondary/30">
                     <td className="p-3.5 font-medium">
-                      <Link href={`/clips/${c.id}`} className="hover:text-primary hover:underline">
-                        {c.title}
+                      <Link href={`/clips/${c.id}`} className="flex items-center gap-3 hover:text-primary hover:underline">
+                        <Thumbnail src={c.sourceVideo?.thumbnailUrl} className="h-9 w-16" />
+                        <span className="line-clamp-2">{c.title}</span>
                       </Link>
                     </td>
                     <td className="p-3.5 text-muted-foreground">{c.creator?.displayName ?? '—'}</td>
                     <td className="p-3.5 font-mono">{c.durationSec}s</td>
                     <td className="p-3.5 font-mono">{c.complianceScore}/100</td>
-                    <td className="p-3.5"><Badge variant="outline">{c.approvalStatus}</Badge></td>
-                    <td className="p-3.5 font-mono text-muted-foreground">{c.executionStatus} ({c.durationMs}ms)</td>
+                    <td className="p-3.5"><Badge variant="outline">{humanize(c.approvalStatus)}</Badge></td>
+                    <td className="p-3.5 font-mono text-muted-foreground">{humanize(c.executionStatus)}</td>
                   </tr>
                 ))}
               </tbody>

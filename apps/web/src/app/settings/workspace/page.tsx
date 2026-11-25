@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -13,6 +13,30 @@ export default function WorkspaceSettingsPage() {
   const { token, workspace, workspaceRole, refreshSession, notify } = useAuth();
   const [wsName, setWsName] = useState(workspace?.name ?? '');
   const [busy, setBusy] = useState(false);
+  const [automation, setAutomation] = useState<{
+    autoPublishEnabled: boolean; autoPublishGloballyDisabled: boolean;
+    analysisHoursUsed: number; monthlyAnalysisHours: number; maxRecordingHours: number; workerConcurrency: number;
+  } | null>(null);
+  const canManage = workspaceRole === 'OWNER' || workspaceRole === 'ADMIN';
+
+  useEffect(() => {
+    if (!token) return;
+    void apiRequest<NonNullable<typeof automation>>('/api/v1/workspace/automation', { token })
+      .then((res) => { if (res.ok && res.json.data) setAutomation(res.json.data); });
+  }, [token]);
+
+  async function setAutoPublish(enabled: boolean) {
+    if (!token) return;
+    const res = await apiRequest<NonNullable<typeof automation>>('/api/v1/workspace/automation', {
+      method: 'PATCH', token, body: { autoPublishEnabled: enabled },
+    });
+    if (res.ok && res.json.data) {
+      setAutomation(res.json.data);
+      notify(enabled ? 'Automatic publishing is on for approved destinations.' : 'Automatic publishing is off.', 'success');
+    } else {
+      notify('Only workspace owners and admins can change automatic publishing.', 'error');
+    }
+  }
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
@@ -66,6 +90,33 @@ export default function WorkspaceSettingsPage() {
             {busy ? 'Saving...' : 'Save Workspace'}
           </Button>
         </form>
+
+        {automation && (
+          <section className="max-w-lg rounded-lg border border-border bg-card p-6 space-y-3">
+            <h2 className="text-sm font-semibold">Automation</h2>
+            <label className="flex items-start gap-3 text-sm">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={automation.autoPublishEnabled}
+                disabled={!canManage || automation.autoPublishGloballyDisabled}
+                onChange={(e) => void setAutoPublish(e.target.checked)}
+              />
+              <span>
+                Publish finished clips automatically
+                <span className="block text-xs text-muted-foreground">
+                  Only to destinations that also allow automatic posting. Everything else waits for review.
+                  {automation.autoPublishGloballyDisabled && ' Automatic posting is paused for all workspaces by the operator.'}
+                </span>
+              </span>
+            </label>
+            <p className="text-xs text-muted-foreground">
+              Your plan analyzes up to {automation.monthlyAnalysisHours} hours of recordings a month
+              ({automation.analysisHoursUsed} used), {automation.maxRecordingHours} hours per recording,
+              with {automation.workerConcurrency} {automation.workerConcurrency === 1 ? 'job' : 'jobs'} at a time.
+            </p>
+          </section>
+        )}
       </div>
     </AppShell>
   );

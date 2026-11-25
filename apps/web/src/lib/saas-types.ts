@@ -19,6 +19,8 @@ export interface SaasWorkspace {
   planTier: 'FREE' | 'STARTER' | 'PRO' | 'ENTERPRISE';
   subscriptionStatus: string;
   billingProviderMode: string;
+  /** Set once the workspace has paid through Stripe; enables the billing portal. */
+  stripeCustomerId?: string | null;
   monthlyClipLimit: number;
   clipsUsedThisPeriod: number;
   primaryPlatform: string;
@@ -38,11 +40,14 @@ export interface PlanDef {
 }
 
 export interface Creator {
+  autoMonitorEnabled: boolean;
   id: string;
   handle: string;
   displayName: string;
   platform: string;
   channelUrl: string;
+  /** Channel profile photo read from the platform. */
+  avatarUrl?: string | null;
   tags: string[];
   requiredTopics: string[];
   bannedKeywords: string[];
@@ -50,6 +55,10 @@ export interface Creator {
   defaultLayout: string;
   defaultCaptionStyle: string;
   enableSfx: boolean;
+  spokenLanguage?: string;
+  /** Why the last channel check failed, when it did. */
+  sourceAccessError?: string | null;
+  lastPolledAt?: string | null;
 }
 
 export interface SocialAccount {
@@ -59,7 +68,9 @@ export interface SocialAccount {
   accountHandle: string;
   autoPublishApproved: boolean;
   integrationMode: string;
-  hasEncryptedToken: boolean;
+  hasEncryptedToken?: boolean;
+  /** Profile photo from the platform, set when the account is connected. */
+  avatarUrl?: string | null;
 }
 
 export interface RouteRule {
@@ -88,12 +99,16 @@ export interface ClipJob {
   compliancePassed: boolean;
   complianceScore: number;
   approvalStatus: string;
+  /** Why the clip was flagged for a person to check, when it was. */
+  qualityIssue?: string | null;
   complianceReport: {
     matchedTopics: string[];
     disqualifiersTriggered: string[];
     reasons: string[];
   };
   creator?: Creator;
+  /** The recording the clip was cut from, with its platform thumbnail. */
+  sourceVideo?: { id: string; title: string; videoUrl: string; thumbnailUrl: string | null } | null;
 }
 
 export interface PublishPost {
@@ -137,6 +152,22 @@ export interface SupportTicketItem {
   createdAt: string;
 }
 
+export interface ChannelScanResult {
+  creatorsScanned: number;
+  detectedVideos: unknown[];
+  unavailableChannels: string[];
+  unsupportedChannels: number;
+}
+
+export function describeChannelScan(scan: ChannelScanResult) {
+  const count = scan.detectedVideos.length;
+  const messages: string[] = [];
+  if (scan.creatorsScanned) messages.push(count ? `New uploads found: ${count}.` : 'No new YouTube uploads found.');
+  if (scan.unavailableChannels.length) messages.push(`Could not read YouTube uploads for ${scan.unavailableChannels.join(', ')}. Check the channel URL and retry.`);
+  if (scan.unsupportedChannels) messages.push('Scan checks YouTube channels. Other sources require a recording connector.');
+  return messages.join(' ') || 'Add a monitored YouTube channel to scan for uploads.';
+}
+
 export async function apiRequest<T = unknown>(
   path: string,
   options: {
@@ -151,11 +182,16 @@ export async function apiRequest<T = unknown>(
     ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
     ...(options.extraHeaders ?? {}),
   };
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: options.method ?? 'GET',
-    headers,
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      method: options.method ?? 'GET',
+      headers,
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    });
+  } catch {
+    return { ok: false, status: 0, json: { error: 'Could not reach Clip Network. Check your connection and retry.' } };
+  }
   const json = (await res.json().catch(() => ({}))) as {
     success?: boolean;
     data?: T;

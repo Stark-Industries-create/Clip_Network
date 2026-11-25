@@ -178,9 +178,8 @@ export function PublicFooter() {
         <div className="mt-12 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-t border-border pt-6 text-[11px] text-muted-foreground">
           <span>© {new Date().getFullYear()} Clip Network. All rights reserved.</span>
           <div className="flex items-center gap-4">
-            <Link href="/docs#privacy" className="hover:text-foreground">Privacy</Link>
-            <Link href="/docs#terms" className="hover:text-foreground">Terms</Link>
-            <span className="font-mono">Multi-Tenant SaaS v2.0</span>
+            <Link href="/privacy" className="hover:text-foreground">Privacy</Link>
+            <Link href="/terms" className="hover:text-foreground">Terms</Link>
           </div>
         </div>
       </div>

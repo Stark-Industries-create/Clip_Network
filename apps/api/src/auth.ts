@@ -248,7 +248,7 @@ export async function requireSuperAdmin(
     });
     return null;
   }
-  if (ctx.systemRole !== 'SUPER_ADMIN') {
+  if (ctx.systemRole !== 'SUPER_ADMIN' || !ctx.emailVerified || ctx.authMethod !== 'SESSION') {
     void reply.status(403).send({
       success: false,
       errorCode: 'FORBIDDEN_ADMIN_ONLY',

@@ -16,16 +16,30 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuth } from '@/components/providers/AuthProvider';
-import { apiRequest, type ClipJob, type PublishPost } from '@/lib/saas-types';
+import { usePolling } from '@/lib/use-polling';
+import { apiRequest, describeChannelScan, type ChannelScanResult, type ClipJob, type PublishPost } from '@/lib/saas-types';
+import { humanize } from '@/lib/humanize';
 
 interface DetectedVideo {
   id: string;
   title: string;
   videoUrl: string;
   detectionStatus: string;
+  clips?: {
+    id: string;
+    executionStatus: string;
+    approvalStatus?: string;
+    startSec: number;
+    endSec?: number;
+    contentType?: string;
+    qualityIssue?: string | null;
+    errorMessage?: string | null;
+    publishPosts?: { id: string; platform: string; status: string; errorMessage?: string | null }[];
+  }[];
+  automationError?: string | null;
   clipJobId?: string | null;
   detectedAt: string;
-  creator?: { displayName: string; handle: string; platform: string };
+  creator?: { id: string; displayName: string; handle: string; platform: string; sourceAccessError?: string | null };
 }
 
 interface AnalyticsOverview {
@@ -51,6 +65,7 @@ export default function DashboardPage() {
   const [clips, setClips] = useState<ClipJob[]>([]);
   const [posts, setPosts] = useState<PublishPost[]>([]);
   const [scanning, setScanning] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -64,34 +79,69 @@ export default function DashboardPage() {
     if (vRes.ok && vRes.json.data) setVideos(vRes.json.data);
     if (cRes.ok && cRes.json.data) setClips(cRes.json.data);
     if (pRes.ok && pRes.json.data) setPosts(pRes.json.data);
+    setLoadFailed([aRes, vRes, cRes, pRes].some(result => !result.ok));
   }, [token]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
+  // Refresh only while something is being detected, analyzed or rendered (and never in a hidden tab).
+  const working = videos.some((v) => ['LIVE', 'FINALIZING', 'PROCESSING'].includes(v.detectionStatus) ||
+    (v.detectionStatus === 'DETECTED' && !v.automationError)) ||
+    clips.some((c) => c.executionStatus === 'QUEUED' || c.executionStatus === 'RUNNING');
+  // Light refresh: only the lists that change while work runs, not the analytics rollup.
+  usePolling(async () => {
+    if (!token) return;
+    const [vRes, cRes] = await Promise.all([
+      apiRequest<DetectedVideo[]>('/api/v1/monitor/videos', { token }),
+      apiRequest<ClipJob[]>('/api/v1/clips', { token }),
+    ]);
+    if (vRes.ok && vRes.json.data) setVideos(vRes.json.data);
+    if (cRes.ok && cRes.json.data) setClips(cRes.json.data);
+  }, 10_000, working);
+
+  const [failingChannels, setFailingChannels] = useState<Array<{ id: string; displayName: string; sourceAccessError: string }>>([]);
+  useEffect(() => {
+    if (!token) return;
+    void apiRequest<Array<{ id: string; displayName: string; sourceAccessError?: string | null }>>('/api/v1/creators', { token })
+      .then((res) => {
+        if (res.ok && res.json.data) {
+          setFailingChannels(res.json.data.flatMap((c) => (c.sourceAccessError ? [{ id: c.id, displayName: c.displayName, sourceAccessError: c.sourceAccessError }] : [])));
+        }
+      }).catch(() => {});
+  }, [token, videos]);
+
+  async function retryRecording(id: string) {
+    const res = await apiRequest('/api/v1/monitor/videos/' + id + '/queue', { method: 'POST', token });
+    notify(res.ok ? 'Recording queued for analysis.' : (
+      typeof res.json.error === 'string' ? res.json.error : 'Check the recording connection and retry.'
+    ), res.ok ? 'success' : 'error');
+    await load();
+  }
+
+  async function retryChannel(creatorId: string) {
+    if (!token) return;
+    const res = await apiRequest<ChannelScanResult>('/api/v1/monitor/scan', { method: 'POST', token, body: { creatorId } });
+    notify(res.ok && res.json.data ? describeChannelScan(res.json.data) : 'Could not check this channel.', res.ok ? 'success' : 'error');
+    await load();
+  }
+
   async function handleScanChannels() {
     if (!token) return;
     setScanning(true);
-    const res = await apiRequest<{
-      creatorsScanned: number;
-      clipsCreated: number;
-      postsRouted: number;
-    }>('/api/v1/monitor/scan', {
+    const res = await apiRequest<ChannelScanResult>('/api/v1/monitor/scan', {
       method: 'POST',
       token,
-      body: { autoExecute: true },
+      body: {},
     });
     setScanning(false);
     if (res.ok && res.json.data) {
       await refreshSession();
       await load();
-      notify(
-        `Scanned ${res.json.data.creatorsScanned} channel(s): ${res.json.data.clipsCreated} clip(s) generated, ${res.json.data.postsRouted} post(s) routed.`,
-        'success',
-      );
+      notify(describeChannelScan(res.json.data), res.json.data.creatorsScanned ? 'success' : 'error');
     } else {
-      notify('Could not scan channels. Add a creator channel first.', 'error');
+      notify(typeof res.json.error === 'string' ? res.json.error : 'Could not scan channels. Retry.', 'error');
     }
   }
 
@@ -119,6 +169,12 @@ export default function DashboardPage() {
       }
     >
       <div className="space-y-6">
+        {loadFailed && (
+          <div role="alert" className="flex items-center justify-between gap-3 rounded-md border border-border bg-card p-3 text-sm">
+            <span>Some dashboard data could not load.</span>
+            <Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>
+          </div>
+        )}
         {/* Primary KPI Row */}
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {[
@@ -158,7 +214,9 @@ export default function DashboardPage() {
               <div>
                 <h2 className="font-display text-sm font-semibold">Posted Video Views &amp; Engagement</h2>
                 <p className="text-[11px] text-muted-foreground font-mono">
-                  {analytics?.scope ?? 'SANDBOX_SIMULATED_TELEMETRY'}
+                  {analytics?.scope === 'LIVE_PLATFORM_METRICS' ? 'Platform data'
+                    : analytics?.scope === 'MIXED_TELEMETRY' ? 'Platform data and sandbox simulation'
+                      : 'Sandbox simulation'}
                 </p>
               </div>
               <Link href="/analytics" className="text-xs text-primary hover:underline flex items-center gap-1">
@@ -224,6 +282,7 @@ export default function DashboardPage() {
               <h2 className="font-display text-sm font-semibold">
                 Auto-Detected Channel Videos ({videos.length})
               </h2>
+              <Link href="/sources" className="text-xs text-primary hover:underline">Generate from Replay</Link>
               <button
                 type="button"
                 onClick={handleScanChannels}
@@ -232,6 +291,16 @@ export default function DashboardPage() {
                 Scan for new uploads
               </button>
             </div>
+            {failingChannels.length > 0 && (
+              <div role="alert" className="border-b border-border bg-destructive/10 px-5 py-3 text-xs space-y-1">
+                {failingChannels.map((c) => (
+                  <div key={c.id} className="flex flex-wrap items-center justify-between gap-2">
+                    <span><strong>{c.displayName}:</strong> {c.sourceAccessError}</span>
+                    <Link href={`/creators/${c.id}`} className="text-primary underline">Fix channel</Link>
+                  </div>
+                ))}
+              </div>
+            )}
             {videos.length === 0 ? (
               <div className="p-8 text-center space-y-2">
                 <p className="text-sm font-medium">No channel uploads scanned yet</p>
@@ -251,9 +320,34 @@ export default function DashboardPage() {
                     </div>
                     <div className="flex items-center gap-2">
                       <Badge variant={v.detectionStatus === 'CLIPPED' ? 'default' : 'outline'}>
-                        {v.detectionStatus}
+                        {humanize(v.detectionStatus)}
                       </Badge>
-                      {v.clipJobId && (
+                      {v.automationError && (<>
+                        <span role="status">{v.automationError}</span>
+                        <Button size="sm" variant="outline" onClick={() => void retryRecording(v.id)}>Retry recording</Button>
+                      </>)}
+                      {v.creator?.sourceAccessError && (<>
+                        <span role="status" className="text-destructive">{v.creator.sourceAccessError}</span>
+                        <Button size="sm" variant="outline" onClick={() => void retryChannel(v.creator!.id)}>Retry channel</Button>
+                        <Button size="sm" variant="ghost" asChild><Link href="/creators">Reconnect</Link></Button>
+                      </>)}
+                      {v.clips?.map(clip => (
+                        <div key={clip.id} className="flex flex-wrap items-center gap-1">
+                          <Button size="sm" variant="ghost" asChild>
+                            <Link href={`/clips/${clip.id}`}>
+                              {Math.floor(clip.startSec)}s{clip.contentType ? ` · ${clip.contentType.toLowerCase()}` : ''} · {clip.approvalStatus === 'NEEDS_REVIEW' ? 'needs review' : clip.executionStatus}
+                            </Link>
+                          </Button>
+                          {(clip.qualityIssue || clip.errorMessage) && <span className="text-muted-foreground">{clip.errorMessage ?? clip.qualityIssue}</span>}
+                          {clip.publishPosts?.map(post => (
+                            <Badge key={post.id} variant={post.status.startsWith('PUBLISHED') ? 'default' : post.status === 'FAILED' ? 'destructive' : 'outline'}
+                              title={post.errorMessage ?? undefined}>
+                              {post.platform} {post.status.toLowerCase().replace(/_/g, ' ')}
+                            </Badge>
+                          ))}
+                        </div>
+                      ))}
+                      {!v.clips?.length && v.clipJobId && (
                         <Button size="sm" variant="ghost" asChild>
                           <Link href={`/clips/${v.clipJobId}`}>Review →</Link>
                         </Button>

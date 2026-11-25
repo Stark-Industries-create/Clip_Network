@@ -7,6 +7,7 @@ import { Clapperboard, Eye, EyeOff } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { GoogleSignInButton } from '@/components/GoogleSignInButton';
 import { useAuth } from '@/components/providers/AuthProvider';
 import { apiRequest, type SaasUser, type SaasWorkspace } from '@/lib/saas-types';
 
@@ -98,6 +99,7 @@ export default function LoginPage() {
             </div>
           )}
 
+          <GoogleSignInButton />
           <form onSubmit={onSubmit} className="space-y-4">
             <div className="space-y-1.5">
               <Label htmlFor="email">Email</Label>

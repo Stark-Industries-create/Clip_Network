@@ -5,8 +5,20 @@ import { buildTenantClipObjectKey, createPresignedS3Url } from '../integrations/
 import { renderBrandedEmail } from '../integrations/email.js';
 import { parseYouTubeAtomLatestVideo } from '../integrations/scheduler.js';
 import { getUtcBillingMonthStart, isBillingPeriodExpired } from '../billing-period.js';
+import { placeSpeechPhrase, readSpeechIntervals } from '../services/speech-timing.js';
 
 describe('Production Security & External Integration Adapters', () => {
+  it('ends a caption with its spoken words when the next phrase follows a long pause', () => {
+    const intervals = readSpeechIntervals([
+      'Final speech segments after filtering: 2',
+      'VAD segment 0: start = 0.00, end = 1.66',
+      'VAD segment 1: start = 3.55, end = 5.50',
+    ].join('\n'));
+    const phrase = { text: 'right here.', offsets: { from: 100, to: 2200 } };
+    expect(placeSpeechPhrase(phrase, intervals[1]!)).toEqual({ start: 3650, end: 5500, text: 'right here.' });
+    expect(() => readSpeechIntervals('Final speech segments after filtering: 1')).toThrow();
+  });
+
   it('1. SSRF guard blocks loopback, private CIDR, cloud metadata & non-HTTP schemes', () => {
     expect(assertSafeExternalUrl('http://127.0.0.1:4100/api/health').safe).toBe(false);
     expect(assertSafeExternalUrl('http://localhost:3100').safe).toBe(false);

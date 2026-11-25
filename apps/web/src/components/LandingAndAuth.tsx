@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ArrowRight,
   Check,
@@ -21,6 +21,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
 import { apiRequest, type PlanDef, type SaasUser, type SaasWorkspace } from '@/lib/saas-types';
+import { GoogleSignInButton } from '@/components/GoogleSignInButton';
 
 type AuthMode = 'LANDING' | 'LOGIN' | 'REGISTER' | 'FORGOT' | 'RESET';
 
@@ -52,7 +53,9 @@ export function LandingAndAuth({
   const [regEmail, setRegEmail] = useState('');
   const [regPassword, setRegPassword] = useState('');
   const [regWorkspace, setRegWorkspace] = useState('');
-  const [termsAccepted, setTermsAccepted] = useState(true);
+  const [termsAccepted, setTermsAccepted] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => setHydrated(true), []);
 
   // Login state
   const [loginEmail, setLoginEmail] = useState('');
@@ -362,75 +365,82 @@ export function LandingAndAuth({
               )}
 
               {mode === 'REGISTER' && (
+                <>
+                <GoogleSignInButton label="Sign up with Google" />
                 <form onSubmit={handleRegister} className="space-y-3">
-                  <div className="space-y-1">
-                    <Label htmlFor="reg-name">Full Name</Label>
-                    <Input
-                      id="reg-name"
-                      required
-                      placeholder="Alex Founder"
-                      value={regName}
-                      onChange={(e) => setRegName(e.target.value)}
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label htmlFor="reg-email">Work Email</Label>
-                    <Input
-                      id="reg-email"
-                      type="email"
-                      required
-                      placeholder="alex@studio.io"
-                      value={regEmail}
-                      onChange={(e) => setRegEmail(e.target.value)}
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label htmlFor="reg-ws">Workspace / Agency Name</Label>
-                    <Input
-                      id="reg-ws"
-                      placeholder="Viral Clips Agency"
-                      value={regWorkspace}
-                      onChange={(e) => setRegWorkspace(e.target.value)}
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label htmlFor="reg-pw">Password (8+ chars, letter + number)</Label>
-                    <Input
-                      id="reg-pw"
-                      type="password"
-                      required
-                      minLength={8}
-                      placeholder="••••••••"
-                      value={regPassword}
-                      onChange={(e) => setRegPassword(e.target.value)}
-                    />
-                  </div>
-                  <label className="flex items-start gap-2 text-xs text-muted-foreground pt-1">
-                    <input
-                      type="checkbox"
-                      checked={termsAccepted}
-                      onChange={(e) => setTermsAccepted(e.target.checked)}
-                      className="mt-0.5"
-                    />
-                    <span>I agree to the Terms of Service and Privacy Policy.</span>
-                  </label>
-                  <Button type="submit" className="w-full" disabled={busy || !termsAccepted}>
-                    {busy ? 'Creating workspace...' : 'Create Account'}
-                  </Button>
-                  <p className="text-center text-xs text-muted-foreground">
-                    Already have an account?{' '}
-                    <button
-                      type="button"
-                      className="font-medium text-primary hover:underline"
-                      onClick={() => { setMode('LOGIN'); setErrorMsg(null); }}
-                    >
-                      Sign in
-                    </button>
-                  </p>
+                  <fieldset disabled={!hydrated} className="space-y-3 min-w-0">
+                    <div className="space-y-1">
+                      <Label htmlFor="reg-name">Full Name</Label>
+                      <Input
+                        id="reg-name"
+                        required
+                        placeholder="Alex Founder"
+                        value={regName}
+                        onChange={(e) => setRegName(e.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor="reg-email">Work Email</Label>
+                      <Input
+                        id="reg-email"
+                        type="email"
+                        required
+                        placeholder="alex@studio.io"
+                        value={regEmail}
+                        onChange={(e) => setRegEmail(e.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor="reg-ws">Workspace / Agency Name</Label>
+                      <Input
+                        id="reg-ws"
+                        placeholder="Viral Clips Agency"
+                        value={regWorkspace}
+                        onChange={(e) => setRegWorkspace(e.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor="reg-pw">Password (8+ chars, letter + number)</Label>
+                      <Input
+                        id="reg-pw"
+                        type="password"
+                        required
+                        minLength={8}
+                        placeholder="••••••••"
+                        value={regPassword}
+                        onChange={(e) => setRegPassword(e.target.value)}
+                      />
+                    </div>
+                    <label className="flex items-start gap-2 text-xs text-muted-foreground pt-1">
+                      <input
+                        type="checkbox"
+                        checked={termsAccepted}
+                        onChange={(e) => setTermsAccepted(e.target.checked)}
+                        className="mt-0.5"
+                      />
+                      <span>I agree to the Terms of Service and Privacy Policy.</span>
+                    </label>
+                    <Button type="submit" className="w-full" disabled={busy || !termsAccepted}>
+                      {busy ? 'Creating workspace...' : 'Create Account'}
+                    </Button>
+                    <p className="text-center text-xs text-muted-foreground">
+                      Already have an account?{' '}
+                      <button
+                        type="button"
+                        className="font-medium text-primary hover:underline"
+                        onClick={() => { setMode('LOGIN'); setErrorMsg(null); }}
+                      >
+                        Sign in
+                      </button>
+                    </p>
+                  </fieldset>
                 </form>
+                </>
               )}
 
               {mode === 'LOGIN' && (
+                <>
+                <GoogleSignInButton />
                 <form onSubmit={handleLogin} className="space-y-3">
                   <div className="space-y-1">
                     <Label htmlFor="login-email">Email</Label>
@@ -484,6 +494,7 @@ export function LandingAndAuth({
                     </button>
                   </p>
                 </form>
+                </>
               )}
 
               {mode === 'FORGOT' && (

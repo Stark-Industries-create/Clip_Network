@@ -1,15 +1,11 @@
-import type { PrismaClient } from '@prisma/client';
-import { evaluateClipCompliance } from '@clip-network/shared';
-import {
-  alignTranscriptToSpeechWindows,
-  buildAutoSfxCuesForCuts,
-  buildWordSyncedAss,
-} from '@clip-network/clip-engine';
-import { tryFetchYouTubeChannelLatest } from '../integrations/scheduler.js';
-import { ensureCurrentBillingPeriod } from '../billing-period.js';
+import { Prisma, type PrismaClient } from '@prisma/client';
+import { tryFetchYouTubeChannelVideos, type ParsedFeedVideo } from '../integrations/scheduler.js';
+import { refreshCreatorProfile } from './channel-profile.js';
 
 export interface ChannelScanResult {
   creatorsScanned: number;
+  unavailableChannels: string[];
+  unsupportedChannels: number;
   detectedVideos: unknown[];
   clipsCreated: number;
   postsRouted: number;
@@ -20,8 +16,10 @@ export async function scanWorkspaceChannels(params: {
   workspaceId: string;
   userId?: string;
   creatorId?: string;
-  autoExecute?: boolean;
-  executePublishPost: (postId: string, workspaceId: string, userId?: string) => Promise<unknown>;
+  /** Lists a channel's recordings on YouTube, Twitch or Kick (see services/recording-sources.ts). */
+  discoverReplays?: (platform: string, channelUrl: string, cursor?: string | null) => Promise<ParsedFeedVideo[]>;
+  /** True when an external recording connector delivers this workspace's Twitch and Kick recordings. */
+  connectorManaged?: boolean;
   trackConversion?: (eventName: string, workspaceId?: string, metadata?: unknown) => Promise<void>;
   logAudit?: (
     action: string,
@@ -33,9 +31,7 @@ export async function scanWorkspaceChannels(params: {
   ) => Promise<void>;
 }): Promise<ChannelScanResult | null> {
   const { prisma, workspaceId, userId, creatorId } = params;
-  const autoExecute = params.autoExecute !== false;
-
-  const workspace = await ensureCurrentBillingPeriod(prisma, workspaceId);
+  const workspace = await prisma.workspace.findUnique({ where: { id: workspaceId }, select: { id: true } });
   if (!workspace) return null;
 
   const creators = await prisma.creatorAccount.findMany({
@@ -43,186 +39,100 @@ export async function scanWorkspaceChannels(params: {
       workspaceId,
       ...(creatorId ? { id: creatorId } : { autoMonitorEnabled: true }),
     },
-    include: { routes: { where: { enabled: true }, include: { socialAccount: true } } },
   });
 
   const detectedVideos: unknown[] = [];
-  let clipsCreated = 0;
-  let postsRouted = 0;
-
+  const unavailableChannels: string[] = [];
+  let creatorsScanned = 0;
+  let unsupportedChannels = 0;
   for (const creator of creators) {
-    await prisma.creatorAccount.update({
-      where: { id: creator.id },
-      data: { lastPolledAt: new Date() },
+    // Fill in a missing channel photo in the background; it never delays discovery.
+    if (!creator.avatarUrl && process.env['NODE_ENV'] !== 'test') void refreshCreatorProfile(prisma, creator).catch(() => null);
+    const reportAccess = (sourceAccessError: string | null) => prisma.creatorAccount.update({
+      where: { id: creator.id }, data: { sourceAccessError, sourceAccessCheckedAt: new Date() },
     });
-
-    const requiredTopics = JSON.parse(creator.requiredTopicsJson) as string[];
-    const bannedKeywords = JSON.parse(creator.bannedKeywordsJson) as string[];
-    const tags = JSON.parse(creator.tagsJson) as string[];
-    const primaryTopic = requiredTopics[0] ?? 'Live Stream';
-
-    const liveAtomVideo =
-      creator.platform === 'YOUTUBE'
-        ? await tryFetchYouTubeChannelLatest(creator.channelUrl)
-        : null;
-    const existingAtom = liveAtomVideo
-      ? await prisma.channelVideo.findUnique({
-          where: {
-            creatorId_externalVideoId: {
-              creatorId: creator.id,
-              externalVideoId: liveAtomVideo.externalVideoId,
-            },
-          },
-        })
-      : null;
-
-    const useAtom = Boolean(liveAtomVideo && !existingAtom);
-    const externalVideoId = useAtom
-      ? liveAtomVideo!.externalVideoId
-      : `vid_${creator.handle}_${Date.now().toString(36).slice(-5)}`;
-    const videoTitle = useAtom
-      ? liveAtomVideo!.title
-      : `${creator.displayName} — New ${primaryTopic} Upload (${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})`;
-    const videoUrl = useAtom
-      ? liveAtomVideo!.videoUrl
-      : `${creator.channelUrl.replace(/\/$/, '')}/videos/${externalVideoId}`;
-
-    const channelVideo = await prisma.channelVideo.create({
-      data: {
-        workspaceId,
-        creatorId: creator.id,
-        externalVideoId,
-        title: videoTitle,
-        videoUrl,
-        durationSec: 2400,
-        detectionSource: useAtom ? 'YOUTUBE_ATOM_FEED' : 'CHANNEL_FEED_SCAN',
-        detectionStatus: autoExecute ? 'PROCESSING' : 'DETECTED',
-      },
-    });
-
-    if (params.trackConversion) {
-      await params.trackConversion('VIDEO_DETECTED', workspaceId, {
-        platform: creator.platform,
-        source: useAtom ? 'YOUTUBE_ATOM_FEED' : 'CHANNEL_FEED_SCAN',
-      });
-    }
-
-    if (!autoExecute) {
-      detectedVideos.push({ ...channelVideo, creator });
+    const youtube = creator.platform === 'YOUTUBE';
+    if (!youtube && !params.discoverReplays) {
+      unsupportedChannels++;
+      // Without the worker's recording discovery, Twitch and Kick can only arrive through a connector.
+      await reportAccess(params.connectorManaged ? null
+        : `Recording discovery for ${creator.platform === 'KICK' ? 'Kick' : 'Twitch'} runs in the worker. Retry after it starts.`);
       continue;
     }
-
-    const freshWs = await ensureCurrentBillingPeriod(prisma, workspaceId);
-    if (!freshWs || freshWs.clipsUsedThisPeriod >= freshWs.monthlyClipLimit) {
-      await prisma.channelVideo.update({
-        where: { id: channelVideo.id },
-        data: { detectionStatus: 'SKIPPED' },
-      });
-      detectedVideos.push({ ...channelVideo, detectionStatus: 'SKIPPED', creator });
-      continue;
-    }
-
-    const startedAt = Date.now();
-    const transcript = `${creator.displayName} just dropped a new ${primaryTopic} moment on ${creator.platform}! Chat reacted instantly to the highlight.`;
-    const compliance = evaluateClipCompliance({
-      transcript,
-      caption: videoTitle,
-      requiredTopics,
-      bannedKeywords,
-      disallowLogos: creator.disallowLogos,
-      hasAddedLogos: false,
-    });
-    const speechCues = alignTranscriptToSpeechWindows(transcript, [
-      { startSec: 0.1, endSec: 11.2 },
-      { startSec: 11.6, endSec: 23.0 },
-    ]);
-    const captionStyle = creator.defaultCaptionStyle as
-      | 'HIGH_ENERGY'
-      | 'BOLD_CREATOR'
-      | 'CLEAN_MINIMAL'
-      | 'PODCAST_PREMIUM';
-    const assScript = buildWordSyncedAss(speechCues, captionStyle);
-    const sfxCues = creator.enableSfx ? buildAutoSfxCuesForCuts([11.2, 18.0]) : [];
-    const durationMs = Math.max(1, Date.now() - startedAt);
-    const executionLogs = [
-      `[${new Date().toISOString()}] MONITOR: Detected upload "${videoTitle}" on @${creator.handle}`,
-      `[${new Date().toISOString()}] COMPLIANCE: score=${compliance.score}/100 passed=${String(compliance.passed)}`,
-      `[${new Date().toISOString()}] ENGINE: Aligned ${speechCues.length} caption cues + ${sfxCues.length} SFX cues`,
-      `[${new Date().toISOString()}] COMPLETED in ${durationMs}ms`,
-    ];
-
-    const [clipJob] = await prisma.$transaction([
-      prisma.clipJob.create({
-        data: {
-          workspaceId,
-          creatorId: creator.id,
-          sourceUrl: videoUrl,
-          title: videoTitle,
-          startSec: 120,
-          endSec: 143,
-          durationSec: 23,
-          transcript,
-          layout: creator.defaultLayout,
-          captionStyle,
-          enableSfx: creator.enableSfx,
-          sfxCuesJson: JSON.stringify(sfxCues),
-          assScript,
-          executionStatus: 'COMPLETED',
-          executionLogsJson: JSON.stringify(executionLogs),
-          durationMs,
-          compliancePassed: compliance.passed,
-          complianceScore: compliance.score,
-          complianceReportJson: JSON.stringify(compliance),
-          approvalStatus: compliance.passed ? 'AWAITING_APPROVAL' : 'DISQUALIFIED',
-        },
-      }),
-      prisma.workspace.update({
-        where: { id: workspaceId },
-        data: { clipsUsedThisPeriod: { increment: 1 } },
-      }),
-    ]);
-
-    await prisma.channelVideo.update({
-      where: { id: channelVideo.id },
-      data: { detectionStatus: 'CLIPPED', clipJobId: clipJob.id },
-    });
-    clipsCreated += 1;
-
-    if (compliance.passed) {
-      for (const route of creator.routes) {
-        if (compliance.score < route.minComplianceScore) continue;
-        const routeTags = JSON.parse(route.hashtagsJson) as string[];
-        const tagLine = [...tags, ...routeTags]
-          .map((t) => (t.startsWith('#') ? t : `#${t.replace(/\s+/g, '')}`))
-          .join(' ');
-        const captionText = route.captionTemplate
-          .replace('{hook}', videoTitle)
-          .replace('{tags}', tagLine)
-          .trim();
-
-        const post = await prisma.publishPost.create({
-          data: {
-            workspaceId,
-            clipJobId: clipJob.id,
-            socialAccountId: route.socialAccountId,
-            idempotencyKey: `clip-${clipJob.id}-acct-${route.socialAccountId}`,
-            platform: route.socialAccount.platform,
-            captionText,
-            status: 'AWAITING_APPROVAL',
-            executionMode: route.socialAccount.integrationMode,
-          },
-        });
-
-        if (route.socialAccount.autoPublishApproved) {
-          const published = await params.executePublishPost(post.id, workspaceId, userId);
-          if (published) postsRouted += 1;
-        } else {
-          postsRouted += 1;
-        }
+    let videos: ParsedFeedVideo[] | null = null;
+    let replayDiscoverySucceeded = false;
+    let discoveryError = '';
+    if (params.discoverReplays) {
+      try {
+        videos = await params.discoverReplays(creator.platform, creator.channelUrl, creator.discoveryCursor);
+        replayDiscoverySucceeded = true;
+      } catch (error) {
+        discoveryError = error instanceof Error && /channel URL/.test(error.message) ? error.message : '';
+        console.warn('Replay discovery unavailable', creator.id);
       }
     }
+    // The public upload feed only exists for YouTube.
+    if (youtube) videos ??= await tryFetchYouTubeChannelVideos(creator.channelUrl);
+    if (!videos) {
+      unavailableChannels.push(creator.displayName);
+      await reportAccess(discoveryError || 'Could not read the recordings for this channel. Check the channel URL, then retry.');
+      continue;
+    }
+    creatorsScanned++;
+    const newestReplay = videos.find(video => !video.streamStatus || video.streamStatus === 'REPLAY');
+    const firstWorkerScan = replayDiscoverySucceeded && !creator.discoveryCursor;
 
-    detectedVideos.push({ ...channelVideo, detectionStatus: 'CLIPPED', clipJobId: clipJob.id, creator });
+    const existing = await prisma.channelVideo.findMany({
+      where: { creatorId: creator.id, externalVideoId: { in: videos.map((video) => video.externalVideoId) } },
+      select: { id: true, externalVideoId: true, detectionStatus: true },
+    });
+    const known = new Map(existing.map((video) => [video.externalVideoId, video]));
+
+    for (const video of videos) {
+      const { streamStatus, ...metadata } = video;
+      const detectionStatus = streamStatus === 'LIVE' || streamStatus === 'FINALIZING' ? streamStatus : 'DETECTED';
+      const previous = known.get(video.externalVideoId);
+      if (previous) {
+        if (streamStatus && ['LIVE', 'FINALIZING', 'DETECTED'].includes(previous.detectionStatus) &&
+          previous.detectionStatus !== detectionStatus) {
+          await prisma.channelVideo.updateMany({
+            where: { id: previous.id, clipJobId: null, detectionStatus: previous.detectionStatus },
+            data: { detectionStatus, nextAutomationAttemptAt: null },
+          });
+        }
+        continue;
+      }
+      const created = await prisma.channelVideo.create({
+        data: {
+          ...metadata,
+          // YouTube thumbnails follow a fixed URL; Twitch and Kick listings report their own.
+          thumbnailUrl: metadata.thumbnailUrl ?? (youtube ? `https://i.ytimg.com/vi/${encodeURIComponent(video.externalVideoId)}/mqdefault.jpg` : null),
+          workspaceId,
+          creatorId: creator.id,
+          durationSec: 0,
+          detectionSource: !replayDiscoverySucceeded ? 'YOUTUBE_ATOM_FEED' : `${creator.platform}_REPLAY_MONITOR`,
+          detectionStatus: firstWorkerScan && detectionStatus === 'DETECTED' && video !== newestReplay ? 'SKIPPED' : detectionStatus,
+        },
+      }).catch((error: unknown) => {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return null;
+        throw error;
+      });
+      if (!created) continue;
+      detectedVideos.push({ ...created, creator });
+      await params.trackConversion?.('VIDEO_DETECTED', workspaceId, {
+        platform: creator.platform,
+        source: created.detectionSource,
+      });
+    }
+
+    await prisma.creatorAccount.update({
+      where: { id: creator.id },
+      data: {
+        lastPolledAt: new Date(), sourceAccessCheckedAt: new Date(),
+        sourceAccessError: params.discoverReplays && !replayDiscoverySucceeded
+          ? 'Replay discovery failed, so only recent uploads were checked. Retry to catch up.' : null,
+        ...(replayDiscoverySucceeded && newestReplay ? { discoveryCursor: newestReplay.externalVideoId } : {}) },
+    });
   }
 
   if (params.logAudit) {
@@ -231,10 +141,8 @@ export async function scanWorkspaceChannels(params: {
       'Workspace',
       workspaceId,
       {
-        creatorsScanned: creators.length,
+        creatorsScanned,
         videosDetected: detectedVideos.length,
-        clipsCreated,
-        postsRouted,
       },
       workspaceId,
       userId,
@@ -242,9 +150,11 @@ export async function scanWorkspaceChannels(params: {
   }
 
   return {
-    creatorsScanned: creators.length,
+    creatorsScanned,
+    unavailableChannels,
+    unsupportedChannels,
     detectedVideos,
-    clipsCreated,
-    postsRouted,
+    clipsCreated: 0,
+    postsRouted: 0,
   };
 }

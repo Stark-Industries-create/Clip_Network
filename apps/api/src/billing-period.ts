@@ -29,11 +29,14 @@ export async function ensureCurrentBillingPeriod(
     return workspace;
   }
 
-  return prisma.workspace.update({
-    where: { id: workspace.id },
+  const currentMonth = getUtcBillingMonthStart(now);
+  await prisma.workspace.updateMany({
+    where: { id: workspace.id, periodResetAt: { lt: currentMonth } },
     data: {
       clipsUsedThisPeriod: 0,
-      periodResetAt: getUtcBillingMonthStart(now),
+      analysisSecondsUsed: 0,
+      periodResetAt: currentMonth,
     },
   });
+  return prisma.workspace.findUnique({ where: { id: workspaceId } });
 }

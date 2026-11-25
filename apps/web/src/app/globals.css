@@ -16,13 +16,13 @@
     --muted-foreground: 240 5% 42%;
     --accent: 72 80% 42%;
     --accent-foreground: 240 10% 7%;
-    --destructive: 0 80% 52%;
+    --destructive: 0 74% 42%; /* 5.4:1 on bg, card and its own 10% tint */
     --destructive-foreground: 0 0% 100%;
     --border: 40 8% 86%;
     --input: 40 8% 82%;
     --ring: 240 10% 10%;
-    --success: 142 71% 36%;
-    --warning: 38 92% 46%;
+    --success: 142 76% 26%; /* 4.9:1 */
+    --warning: 30 95% 32%; /* 4.8:1 */
     --radius: 0.5rem;
   }
 
@@ -39,8 +39,8 @@
     --muted-foreground: 240 5% 60%;
     --accent: 72 100% 50%;
     --accent-foreground: 240 10% 4%;
-    --destructive: 348 83% 54%;
-    --destructive-foreground: 0 0% 100%;
+    --destructive: 348 90% 64%; /* 5.1:1 on card and its own 10% tint */
+    --destructive-foreground: 240 10% 4%; /* 6.0:1 on the destructive fill (white would be 3.3:1) */
     --border: 240 4% 16%;
     --input: 240 4% 18%;
     --ring: 72 100% 50%;

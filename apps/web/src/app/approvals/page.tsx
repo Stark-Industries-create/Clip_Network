@@ -8,6 +8,7 @@ import { Badge } from '@/components/ui/badge';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuth } from '@/components/providers/AuthProvider';
 import { apiRequest, type ClipJob } from '@/lib/saas-types';
+import { ProfilePhoto, Thumbnail } from '@/components/ui/profile-photo';
 
 export default function ApprovalsQueuePage() {
   const { token, notify } = useAuth();
@@ -17,7 +18,8 @@ export default function ApprovalsQueuePage() {
     if (!token) return;
     const res = await apiRequest<ClipJob[]>('/api/v1/clips', { token });
     if (res.ok && res.json.data) {
-      setClips(res.json.data.filter((c) => c.approvalStatus === 'AWAITING_APPROVAL'));
+      // Flagged clips (a quality issue such as a cut-off sentence) also wait for a person.
+      setClips(res.json.data.filter((c) => c.executionStatus === 'COMPLETED' && ['AWAITING_APPROVAL', 'NEEDS_REVIEW'].includes(c.approvalStatus)));
     }
   }, [token]);
 
@@ -53,18 +55,24 @@ export default function ApprovalsQueuePage() {
         <div className="divide-y divide-border rounded-lg border border-border bg-card">
           {clips.map((c) => (
             <div key={c.id} className="flex flex-wrap items-center justify-between gap-4 p-4">
-              <div className="space-y-1">
-                <div className="text-sm font-medium">{c.title}</div>
-                <div className="flex items-center gap-2 text-xs text-muted-foreground font-mono">
-                  <span>{c.creator?.displayName ?? 'Creator'}</span>
-                  <span>•</span>
-                  <span>Score {c.complianceScore}/100</span>
-                  <span>•</span>
-                  <span>{c.durationSec}s</span>
+              <Link href={`/clips/${c.id}`} className="flex min-w-0 flex-1 items-center gap-4">
+                <div className="relative shrink-0">
+                  <Thumbnail src={c.sourceVideo?.thumbnailUrl} className="h-[72px] w-32" />
+                  <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1 font-mono text-[10px] text-white">{Math.round(c.durationSec)}s</span>
                 </div>
-              </div>
+                <div className="min-w-0 space-y-1">
+                  <div className="line-clamp-2 text-sm font-medium hover:text-primary">{c.title}</div>
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <ProfilePhoto src={c.creator?.avatarUrl} name={c.creator?.displayName ?? 'Creator'} size={18} />
+                    <span>{c.creator?.displayName ?? 'Creator'}</span>
+                    <span>·</span>
+                    <span>Score {c.complianceScore}/100</span>
+                  </div>
+                  {c.qualityIssue && <div className="text-xs text-warning">Check before approving: {c.qualityIssue}</div>}
+                </div>
+              </Link>
               <div className="flex items-center gap-2">
-                <Badge variant="outline">{c.compliancePassed ? 'COMPLIANT' : 'BLOCKED'}</Badge>
+                <Badge variant="outline">{c.approvalStatus === 'NEEDS_REVIEW' ? 'Flagged' : c.compliancePassed ? 'Compliant' : 'Blocked'}</Badge>
                 <Button size="sm" variant="ghost" asChild>
                   <Link href={`/clips/${c.id}`}><Eye className="mr-1 h-3.5 w-3.5" /> Inspect</Link>
                 </Button>
