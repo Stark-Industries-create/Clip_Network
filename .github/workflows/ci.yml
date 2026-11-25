@@ -32,12 +32,13 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Generate Prisma client
         run: pnpm --filter @clip-network/api exec prisma generate
+      # Build first: the apps import the workspace packages from their compiled dist/ output.
+      - name: Build
+        run: pnpm run build
       - name: Typecheck
         run: pnpm run typecheck
       - name: Test
         run: pnpm run test
-      - name: Build
-        run: pnpm run build
 
   secret-scan:
     name: Secret scan
